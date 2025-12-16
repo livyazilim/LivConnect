@@ -1,0 +1,17 @@
+bin/
+lib/
+lib64/
+include/
+share/
+pyvenv.cfg
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec
+.DS_Store
+.vscode/
+Documents/LivConnect/
+*.vpn
+*.conf
+*.secrets
