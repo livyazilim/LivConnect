@@ -9,6 +9,8 @@ import re
 import datetime
 import platform
 import threading
+import json
+import time
 
 # Tray Support
 try:
@@ -42,13 +44,22 @@ COLOR_SUCCESS = "#4caf50"
 COLOR_DANGER = "#f44336"
 COLOR_WARNING = "#ff9800"
 COLOR_TEXT = "#333333"
+COLOR_NETWORK = "#673ab7" # Network Manager Purple
 
 class LivConnectApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("LivConnect - VPN Manager")
-        self.root.geometry("1100x750")
+        self.root.title("LivConnect - Enterprise VPN & Network Suite")
+        self.root.geometry("1250x850")
         self.root.configure(bg=COLOR_BG)
+
+        icon_path = os.path.join(os.path.dirname(__file__), "livconnect.png")
+        if os.path.exists(icon_path):
+            try:
+                img = tk.PhotoImage(file=icon_path)
+                self.root.iconphoto(True, img)
+            except Exception as e:
+                print(f"Icon load error: {e}")
 
         # Window Protocol
         self.is_minimized = False
@@ -62,10 +73,10 @@ class LivConnectApp:
 
         # Directories
         self.user_home = os.path.expanduser("~")
-        # UPDATED: Folder name changed to LivConnect
         self.base_dir = os.path.join(self.user_home, "Documents", "LivConnect")
         self.forti_dir = os.path.join(self.base_dir, "forti")
         self.ipsec_dir = os.path.join(self.base_dir, "ipsec")
+        self.net_dir = os.path.join(self.base_dir, "network_profiles")
         self.check_local_folders()
 
         # UI Init
@@ -73,7 +84,7 @@ class LivConnectApp:
         self.create_menu_bar()
         self.setup_ui_components()
 
-        self.log_message(f"LivConnect v1.0 initialized on {SYSTEM_OS}.")
+        self.log_message(f"LivConnect v1.5 initialized on {SYSTEM_OS}.")
         
         # Tray Thread
         if HAS_TRAY:
@@ -83,12 +94,11 @@ class LivConnectApp:
         self.monitor_vpn_status()
 
     # -------------------------------------------------------------------------
-    # UI COMPONENTS
+    # UI COMPONENTS (MODULAR)
     # -------------------------------------------------------------------------
     def setup_ui_components(self):
-        # Footer
+        # Footer (Initialized but managed by view switcher)
         self.action_bar = tk.Frame(self.root, bg="white", height=60, pady=10, padx=10, bd=1, relief="raised")
-        self.action_bar.pack(side=tk.BOTTOM, fill=tk.X)
         
         self.status_canvas = tk.Canvas(self.action_bar, width=20, height=20, bg="white", highlightthickness=0)
         self.status_canvas.pack(side=tk.LEFT, padx=5)
@@ -97,17 +107,17 @@ class LivConnectApp:
         self.status_label = tk.Label(self.action_bar, text="Status: Ready", bg="white", font=("Segoe UI", 11))
         self.status_label.pack(side=tk.LEFT, padx=5)
 
-        self.btn_disconnect = tk.Button(self.action_bar, text="■ DISCONNECT", bg=COLOR_DANGER, fg="white", font=("Segoe UI", 10, "bold"), bd=0, padx=20, pady=8, command=self.disconnect_vpn, state="disabled", cursor="hand2")
+        self.btn_disconnect = tk.Button(self.action_bar, text="■ DISCONNECT VPN", bg=COLOR_DANGER, fg="white", font=("Segoe UI", 10, "bold"), bd=0, padx=20, pady=8, command=self.disconnect_vpn, state="disabled", cursor="hand2")
         self.btn_disconnect.pack(side=tk.RIGHT, padx=5)
 
-        self.btn_connect = tk.Button(self.action_bar, text="▶ CONNECT", bg=COLOR_SUCCESS, fg="white", font=("Segoe UI", 10, "bold"), bd=0, padx=20, pady=8, command=self.connect_vpn, cursor="hand2")
+        self.btn_connect = tk.Button(self.action_bar, text="▶ CONNECT VPN", bg=COLOR_SUCCESS, fg="white", font=("Segoe UI", 10, "bold"), bd=0, padx=20, pady=8, command=self.connect_vpn, cursor="hand2")
         self.btn_connect.pack(side=tk.RIGHT, padx=5)
 
         # Split Pane
         self.main_pane = tk.PanedWindow(self.root, orient=tk.HORIZONTAL, bg=COLOR_BG, sashwidth=4)
         self.main_pane.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        # Sidebar
+        # ----------------- SIDEBAR -----------------
         self.sidebar_frame = tk.Frame(self.main_pane, bg=COLOR_SIDEBAR, width=280)
         self.main_pane.add(self.sidebar_frame)
 
@@ -116,38 +126,47 @@ class LivConnectApp:
         header_frame.pack(fill=tk.X, padx=10)
         tk.Label(header_frame, text="LivConnect", font=("Segoe UI", 18, "bold"), bg=COLOR_SIDEBAR, fg="#1a237e").pack(side=tk.LEFT)
 
-        # Protocol Select
-        proto_frame = tk.Frame(self.sidebar_frame, bg=COLOR_SIDEBAR, pady=10)
-        proto_frame.pack(fill=tk.X, padx=10)
+        # MODULE SELECTION
+        mod_frame = tk.LabelFrame(self.sidebar_frame, text="Module Select", bg=COLOR_SIDEBAR, pady=10, padx=5, font=("Segoe UI", 9, "bold"))
+        mod_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
+        
         self.protocol_var = tk.StringVar(value="forti")
-        self.rb_forti = tk.Radiobutton(proto_frame, text="FortiSSL", variable=self.protocol_var, value="forti", indicatoron=0, bg="#e3f2fd", selectcolor=COLOR_PRIMARY, fg=COLOR_TEXT, font=("Segoe UI", 10, "bold"), command=self.update_ui_mode, padx=10, pady=5)
-        self.rb_forti.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
-        self.rb_ipsec = tk.Radiobutton(proto_frame, text="IPsec / IKEv2", variable=self.protocol_var, value="ipsec", indicatoron=0, bg="#e3f2fd", selectcolor=COLOR_PRIMARY, fg=COLOR_TEXT, font=("Segoe UI", 10, "bold"), command=self.update_ui_mode, padx=10, pady=5)
-        self.rb_ipsec.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+        rb_style = {"indicatoron": 0, "bg": "#e3f2fd", "fg": COLOR_TEXT, "font": ("Segoe UI", 10, "bold"), "pady": 6}
+        
+        tk.Radiobutton(mod_frame, text="FortiSSL VPN", variable=self.protocol_var, value="forti", selectcolor=COLOR_PRIMARY, command=self.switch_main_view, **rb_style).pack(fill=tk.X, pady=2)
+        tk.Radiobutton(mod_frame, text="IPsec / IKEv2", variable=self.protocol_var, value="ipsec", selectcolor=COLOR_PRIMARY, command=self.switch_main_view, **rb_style).pack(fill=tk.X, pady=2)
+        tk.Radiobutton(mod_frame, text="Network Manager", variable=self.protocol_var, value="network", selectcolor=COLOR_NETWORK, command=self.switch_main_view, **rb_style).pack(fill=tk.X, pady=2)
 
-        # List
-        tk.Label(self.sidebar_frame, text="Profiles", bg=COLOR_SIDEBAR, fg="gray", font=("Segoe UI", 9)).pack(anchor="w", padx=15, pady=(10,0))
-        list_scroll = tk.Scrollbar(self.sidebar_frame)
+        # VPN PROFILE LIST
+        self.vpn_list_container = tk.Frame(self.sidebar_frame, bg=COLOR_SIDEBAR)
+        self.vpn_list_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        tk.Label(self.vpn_list_container, text="VPN Profiles", bg=COLOR_SIDEBAR, fg="gray", font=("Segoe UI", 9)).pack(anchor="w", pady=(10,0))
+        list_scroll = tk.Scrollbar(self.vpn_list_container)
         list_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.file_listbox = tk.Listbox(self.sidebar_frame, font=("Segoe UI", 11), bd=0, highlightthickness=0, bg=COLOR_SIDEBAR, selectbackground="#e3f2fd", selectforeground="#0d47a1", activestyle="none", exportselection=False, yscrollcommand=list_scroll.set)
-        self.file_listbox.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.file_listbox = tk.Listbox(self.vpn_list_container, font=("Segoe UI", 11), bd=0, highlightthickness=0, bg=COLOR_SIDEBAR, selectbackground="#e3f2fd", selectforeground="#0d47a1", activestyle="none", exportselection=False, yscrollcommand=list_scroll.set)
+        self.file_listbox.pack(fill=tk.BOTH, expand=True, pady=5)
         list_scroll.config(command=self.file_listbox.yview)
         self.file_listbox.bind('<<ListboxSelect>>', self.load_selected_profile)
 
-        # Sidebar Actions
-        btns_frame = tk.Frame(self.sidebar_frame, bg=COLOR_SIDEBAR)
-        btns_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=10)
+        # VPN ACTIONS
+        self.vpn_btns_frame = tk.Frame(self.sidebar_frame, bg=COLOR_SIDEBAR)
+        self.vpn_btns_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=10)
         
-        tk.Button(btns_frame, text="🗑️", bg="#ffcdd2", fg="#c62828", bd=0, font=("Segoe UI", 10), width=4, pady=8, command=self.delete_profile, cursor="hand2").pack(side=tk.LEFT, padx=(0, 5))
-        tk.Button(btns_frame, text="➕ Create Profile", bg="#eeeeee", fg="#333", bd=0, font=("Segoe UI", 10), pady=8, command=self.create_new_profile, cursor="hand2").pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Button(self.vpn_btns_frame, text="🗑️", bg="#ffcdd2", fg="#c62828", bd=0, font=("Segoe UI", 10), width=4, pady=8, command=self.delete_profile, cursor="hand2").pack(side=tk.LEFT, padx=(0, 5))
+        tk.Button(self.vpn_btns_frame, text="➕ Create Profile", bg="#eeeeee", fg="#333", bd=0, font=("Segoe UI", 10), pady=8, command=self.create_new_profile, cursor="hand2").pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        # Content Area
-        self.content_frame = tk.Frame(self.main_pane, bg=COLOR_BG)
-        self.main_pane.add(self.content_frame)
+        # ----------------- RIGHT CONTENT AREA -----------------
+        self.content_container = tk.Frame(self.main_pane, bg=COLOR_BG)
+        self.main_pane.add(self.content_container)
 
-        editor_header = tk.Frame(self.content_frame, bg=COLOR_BG, pady=5)
+        # -- VIEW 1: VPN EDITOR --
+        self.vpn_view_frame = tk.Frame(self.content_container, bg=COLOR_BG)
+        
+        editor_header = tk.Frame(self.vpn_view_frame, bg=COLOR_BG, pady=5)
         editor_header.pack(fill=tk.X)
-        tk.Label(editor_header, text="Configuration", font=("Segoe UI", 12, "bold"), bg=COLOR_BG).pack(side=tk.LEFT)
+        self.lbl_editor_title = tk.Label(editor_header, text="VPN Configuration", font=("Segoe UI", 12, "bold"), bg=COLOR_BG)
+        self.lbl_editor_title.pack(side=tk.LEFT)
         
         header_btns = tk.Frame(editor_header, bg=COLOR_BG)
         header_btns.pack(side=tk.RIGHT)
@@ -155,34 +174,340 @@ class LivConnectApp:
         self.btn_get_cert = tk.Button(header_btns, text="🛡️ Get/Trust Cert", bg=COLOR_WARNING, fg="white", font=("Segoe UI", 9, "bold"), bd=0, padx=10, pady=5, command=self.detect_forti_cert, cursor="hand2")
         self.btn_get_cert.pack(side=tk.LEFT, padx=(0, 10))
         
-        tk.Button(header_btns, text="💾 Save", bg=COLOR_PRIMARY, fg="white", font=("Segoe UI", 9, "bold"), bd=0, padx=15, pady=5, command=self.save_profile, cursor="hand2").pack(side=tk.LEFT)
+        tk.Button(header_btns, text="💾 Save Config", bg=COLOR_PRIMARY, fg="white", font=("Segoe UI", 9, "bold"), bd=0, padx=15, pady=5, command=self.save_profile, cursor="hand2").pack(side=tk.LEFT)
 
-        # Tabs
-        self.notebook = ttk.Notebook(self.content_frame)
+        self.notebook = ttk.Notebook(self.vpn_view_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True, pady=5)
 
         self.tab1_frame = tk.Frame(self.notebook, bg="white")
-        self.notebook.add(self.tab1_frame, text="  Config (.conf)  ")
+        self.notebook.add(self.tab1_frame, text="  VPN Config (.conf)  ")
         self.editor_conf = scrolledtext.ScrolledText(self.tab1_frame, font=("Consolas", 10), bd=0, padx=10, pady=10)
         self.editor_conf.pack(fill=tk.BOTH, expand=True)
 
         self.tab2_frame = tk.Frame(self.notebook, bg="white")
-        self.notebook.add(self.tab2_frame, text="  Secrets (.secrets)  ")
+        self.notebook.add(self.tab2_frame, text="  VPN Secrets (.secrets)  ")
         self.editor_sec = scrolledtext.ScrolledText(self.tab2_frame, font=("Consolas", 10), bd=0, padx=10, pady=10)
         self.editor_sec.pack(fill=tk.BOTH, expand=True)
 
-        # Logs
-        self.log_frame = tk.LabelFrame(self.content_frame, text="Logs", font=("Segoe UI", 9, "bold"), bg=COLOR_BG, fg="gray")
-        self.log_frame.pack(fill=tk.X, expand=False, pady=(10, 0), ipady=5)
+        # -- VIEW 2: NETWORK MANAGER --
+        self.net_view_frame = tk.Frame(self.content_container, bg=COLOR_BG)
+        self.setup_network_manager_ui(self.net_view_frame)
+
+        # Logs (Shared)
+        self.log_frame = tk.LabelFrame(self.content_container, text="System Logs", font=("Segoe UI", 9, "bold"), bg=COLOR_BG, fg="gray")
+        self.log_frame.pack(side=tk.BOTTOM, fill=tk.X, expand=False, pady=(10, 0), ipady=5)
         
-        self.log_text = scrolledtext.ScrolledText(self.log_frame, height=8, font=("Consolas", 9), bg="#1e1e1e", fg="#00ff00")
+        self.log_text = scrolledtext.ScrolledText(self.log_frame, height=6, font=("Consolas", 9), bg="#1e1e1e", fg="#00ff00")
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         self.log_text.tag_config("INFO", foreground="#00ff00")
         self.log_text.tag_config("ERROR", foreground="#ff5252")
         self.log_text.tag_config("WARN", foreground="orange")
         self.log_text.tag_config("DEBUG", foreground="cyan")
         
-        self.update_ui_mode()
+        # Initial View Load
+        self.switch_main_view()
+
+    # -------------------------------------------------------------------------
+    # VIEW SWITCHING LOGIC
+    # -------------------------------------------------------------------------
+    def switch_main_view(self):
+        """Swaps between VPN Editor and Network Manager views."""
+        mode = self.protocol_var.get()
+        
+        self.vpn_view_frame.pack_forget()
+        self.net_view_frame.pack_forget()
+
+        if mode == "network":
+            # Show Network Manager
+            self.net_view_frame.pack(fill=tk.BOTH, expand=True)
+            self.vpn_list_container.pack_forget()
+            self.vpn_btns_frame.pack_forget()
+            # Hide VPN Footer
+            self.action_bar.pack_forget()
+        else:
+            # Show VPN Editor
+            self.vpn_view_frame.pack(fill=tk.BOTH, expand=True)
+            # Show VPN specific sidebar elements
+            self.vpn_list_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+            self.vpn_btns_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=10)
+            # Show VPN Footer
+            self.action_bar.pack(side=tk.BOTTOM, fill=tk.X)
+            
+            self.update_ui_mode()
+            self.toggle_buttons(self.current_process is not None or self.active_ipsec_conn is not None)
+
+    # -------------------------------------------------------------------------
+    # NETWORK MANAGER UI SETUP
+    # -------------------------------------------------------------------------
+    def setup_network_manager_ui(self, parent):
+        header = tk.Frame(parent, bg=COLOR_BG, pady=5)
+        header.pack(fill=tk.X)
+        tk.Label(header, text="Network & Routing Manager", font=("Segoe UI", 16, "bold"), fg=COLOR_NETWORK, bg=COLOR_BG).pack(side=tk.LEFT, padx=10)
+
+        # 1. Profile Manager Bar
+        top_frame = tk.LabelFrame(parent, text="Profiles", bg="white", pady=10, padx=10)
+        top_frame.pack(fill=tk.X, padx=10)
+
+        tk.Label(top_frame, text="Select Profile:", bg="white").pack(side=tk.LEFT, padx=5)
+        self.net_profile_combo = ttk.Combobox(top_frame, width=25, state="readonly")
+        self.net_profile_combo.pack(side=tk.LEFT, padx=5)
+        self.net_profile_combo.bind("<<ComboboxSelected>>", self.load_network_profile)
+
+        tk.Button(top_frame, text="💾 Save", bg="#e0e0e0", command=self.save_network_profile).pack(side=tk.LEFT, padx=5)
+        tk.Button(top_frame, text="➕ New", bg="#e0e0e0", command=self.create_network_profile).pack(side=tk.LEFT, padx=5)
+        tk.Button(top_frame, text="🗑️ Delete", bg="#ffcdd2", command=self.delete_network_profile).pack(side=tk.LEFT, padx=5)
+
+        # 2. Interface IP Configuration (Static vs DHCP)
+        self.ip_mode_var = tk.StringVar(value="auto")
+        
+        iface_frame = tk.LabelFrame(parent, text="Interface Configuration (Wi-Fi / Ethernet)", bg="white", padx=10, pady=10, font=("Segoe UI", 10, "bold"))
+        iface_frame.pack(fill=tk.X, padx=10, pady=10)
+
+        # Radio Buttons
+        tk.Radiobutton(iface_frame, text="Automatic (DHCP)", variable=self.ip_mode_var, value="auto", bg="white", font=("Segoe UI", 9), command=self.toggle_ip_inputs).pack(anchor="w")
+        tk.Radiobutton(iface_frame, text="Manual (Static IP)", variable=self.ip_mode_var, value="manual", bg="white", font=("Segoe UI", 9), command=self.toggle_ip_inputs).pack(anchor="w")
+
+        # Inputs
+        grid_frame = tk.Frame(iface_frame, bg="white")
+        grid_frame.pack(fill=tk.X, pady=5, padx=20)
+        
+        tk.Label(grid_frame, text="IP Address:", bg="white").grid(row=0, column=0, padx=5, sticky="e")
+        self.ent_iface_ip = tk.Entry(grid_frame, width=20)
+        self.ent_iface_ip.grid(row=0, column=1, padx=5)
+        self.ent_iface_ip.insert(0, "192.168.1.150/24")
+
+        tk.Label(grid_frame, text="Gateway:", bg="white").grid(row=0, column=2, padx=5, sticky="e")
+        self.ent_iface_gw = tk.Entry(grid_frame, width=20)
+        self.ent_iface_gw.grid(row=0, column=3, padx=5)
+        self.ent_iface_gw.insert(0, "192.168.1.1")
+
+        tk.Label(grid_frame, text="Primary DNS:", bg="white").grid(row=0, column=4, padx=5, sticky="e")
+        self.ent_iface_dns = tk.Entry(grid_frame, width=20)
+        self.ent_iface_dns.grid(row=0, column=5, padx=5)
+        self.ent_iface_dns.insert(0, "8.8.8.8")
+
+        self.toggle_ip_inputs() # Set initial state
+
+        # 3. Additional Rules (Routes)
+        rule_frame = tk.LabelFrame(parent, text="Additional Rules (Static Routes)", bg="white", padx=10, pady=10)
+        rule_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        # Inputs for Routes
+        r_frame = tk.Frame(rule_frame, bg="white")
+        r_frame.pack(fill=tk.X, pady=2)
+        tk.Label(r_frame, text="ROUTE ->", bg="white", width=8, anchor="w", font=("Consolas", 10, "bold"), fg="blue").pack(side=tk.LEFT)
+        tk.Label(r_frame, text="Target Subnet:", bg="white").pack(side=tk.LEFT)
+        self.ent_target = tk.Entry(r_frame, width=18)
+        self.ent_target.pack(side=tk.LEFT, padx=5)
+        tk.Label(r_frame, text="Via Gateway:", bg="white").pack(side=tk.LEFT)
+        self.ent_gateway = tk.Entry(r_frame, width=15)
+        self.ent_gateway.pack(side=tk.LEFT, padx=5)
+        
+        # Add Route Button
+        tk.Button(r_frame, text="Add Route", bg="#bbdefb", command=self.add_route_to_list).pack(side=tk.LEFT, padx=(10, 5))
+        
+        # Remove Selected Button (Moved here per request)
+        tk.Button(r_frame, text="Remove Selected", command=self.remove_net_row, bg="#ffcdd2").pack(side=tk.LEFT, padx=5)
+
+        # Treeview
+        columns = ("type", "detail", "gateway")
+        self.net_tree = ttk.Treeview(rule_frame, columns=columns, show="headings", height=5)
+        self.net_tree.heading("type", text="Type")
+        self.net_tree.heading("detail", text="Target Subnet")
+        self.net_tree.heading("gateway", text="Gateway")
+        self.net_tree.column("type", width=80, anchor="center")
+        self.net_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=5)
+        
+        scrollbar = ttk.Scrollbar(rule_frame, orient=tk.VERTICAL, command=self.net_tree.yview)
+        self.net_tree.configure(yscroll=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 4. Big Action Button
+        apply_frame = tk.Frame(parent, bg="white", pady=15)
+        apply_frame.pack(fill=tk.X, side=tk.BOTTOM)
+        
+        # Big Styled Button
+        tk.Button(apply_frame, text="⚡ APPLY CONFIGURATION TO SYSTEM ⚡", bg=COLOR_NETWORK, fg="white", 
+                  font=("Segoe UI", 14, "bold"), pady=15, bd=0, cursor="hand2", 
+                  activebackground="#512da8", activeforeground="white",
+                  command=self.apply_current_net_config).pack(fill=tk.X, padx=20)
+
+        # Init
+        self.refresh_net_profiles()
+
+    def toggle_ip_inputs(self):
+        state = "normal" if self.ip_mode_var.get() == "manual" else "disabled"
+        self.ent_iface_ip.config(state=state)
+        self.ent_iface_gw.config(state=state)
+        self.ent_iface_dns.config(state=state)
+
+    # --- Network Logic (JSON & Execution) ---
+    def refresh_net_profiles(self):
+        if not os.path.exists(self.net_dir): os.makedirs(self.net_dir)
+        files = [f.replace(".json", "") for f in os.listdir(self.net_dir) if f.endswith(".json")]
+        self.net_profile_combo['values'] = sorted(files)
+
+    def create_network_profile(self):
+        name = simple_input(self.root, "New Network Profile", "Profile Name:")
+        if name:
+            path = os.path.join(self.net_dir, name + ".json")
+            # Default structure
+            default_data = {
+                "mode": "auto",
+                "ip": "", "gateway": "", "dns": "",
+                "routes": []
+            }
+            with open(path, 'w') as f: json.dump(default_data, f)
+            self.refresh_net_profiles()
+            self.net_profile_combo.set(name)
+            self.load_network_profile(None)
+
+    def delete_network_profile(self):
+        name = self.net_profile_combo.get()
+        if not name: return
+        if messagebox.askyesno("Confirm", "Delete network profile?"):
+            os.remove(os.path.join(self.net_dir, name + ".json"))
+            self.refresh_net_profiles()
+            self.net_profile_combo.set("")
+            self.clear_net_tree()
+
+    def save_network_profile(self):
+        name = self.net_profile_combo.get()
+        if not name: 
+            messagebox.showwarning("Save", "Select/Create a profile first.")
+            return
+        
+        routes = []
+        for child in self.net_tree.get_children():
+            routes.append(self.net_tree.item(child)["values"])
+        
+        data = {
+            "mode": self.ip_mode_var.get(),
+            "ip": self.ent_iface_ip.get(),
+            "gateway": self.ent_iface_gw.get(),
+            "dns": self.ent_iface_dns.get(),
+            "routes": routes
+        }
+        
+        with open(os.path.join(self.net_dir, name + ".json"), 'w') as f:
+            json.dump(data, f)
+        self.log_message(f"Network profile saved: {name}", "INFO")
+
+    def load_network_profile(self, event):
+        name = self.net_profile_combo.get()
+        path = os.path.join(self.net_dir, name + ".json")
+        self.clear_net_tree()
+        
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                data = json.load(f)
+                # Load Mode
+                self.ip_mode_var.set(data.get("mode", "auto"))
+                self.toggle_ip_inputs()
+                
+                # Load Inputs
+                self.ent_iface_ip.delete(0, tk.END)
+                self.ent_iface_ip.insert(0, data.get("ip", ""))
+                
+                self.ent_iface_gw.delete(0, tk.END)
+                self.ent_iface_gw.insert(0, data.get("gateway", ""))
+                
+                self.ent_iface_dns.delete(0, tk.END)
+                self.ent_iface_dns.insert(0, data.get("dns", ""))
+                
+                # Load Routes
+                for route in data.get("routes", []):
+                    self.net_tree.insert("", tk.END, values=route)
+
+    def add_route_to_list(self):
+        target = self.ent_target.get()
+        gw = self.ent_gateway.get()
+        if target and gw: self.net_tree.insert("", tk.END, values=("ROUTE", target, gw))
+    
+    def add_dns_to_list(self):
+        # Deprecated in this UI version (handled in Interface Config)
+        pass
+
+    def remove_net_row(self):
+        sel = self.net_tree.selection()
+        for item in sel: self.net_tree.delete(item)
+
+    def clear_net_tree(self):
+        for item in self.net_tree.get_children(): self.net_tree.delete(item)
+
+    def get_active_connection_name(self):
+        """Returns the active NetworkManager connection name."""
+        try:
+            # nmcli -t -f NAME,DEVICE connection show --active
+            # Returns: Wired connection 1:eth0
+            res = subprocess.check_output(["nmcli", "-t", "-f", "NAME", "connection", "show", "--active"], text=True)
+            if res:
+                return res.split('\n')[0].strip() # Return first active connection
+        except: return None
+        return None
+
+    def apply_current_net_config(self):
+        conn_name = self.get_active_connection_name()
+        if not conn_name:
+            messagebox.showerror("Error", "No active NetworkManager connection found.")
+            return
+
+        if not messagebox.askyesno("Apply", f"Apply configuration to interface: '{conn_name}'?\n(Requires Admin Privileges)"): return
+
+        self.log_message(f"Applying config to: {conn_name}", "WARN")
+        commands = []
+
+        # 1. Interface Configuration
+        if self.ip_mode_var.get() == "manual":
+            ip = self.ent_iface_ip.get()
+            gw = self.ent_iface_gw.get()
+            dns = self.ent_iface_dns.get()
+            
+            # Set Manual
+            commands.append(f"nmcli con mod '{conn_name}' ipv4.method manual")
+            commands.append(f"nmcli con mod '{conn_name}' ipv4.addresses {ip}")
+            commands.append(f"nmcli con mod '{conn_name}' ipv4.gateway {gw}")
+            commands.append(f"nmcli con mod '{conn_name}' ipv4.dns {dns}")
+        else:
+            # Set Auto (DHCP) - Clear static settings
+            commands.append(f"nmcli con mod '{conn_name}' ipv4.method auto")
+            commands.append(f"nmcli con mod '{conn_name}' ipv4.addresses ''")
+            commands.append(f"nmcli con mod '{conn_name}' ipv4.gateway ''")
+            commands.append(f"nmcli con mod '{conn_name}' ipv4.dns ''")
+
+        # 2. Additional Routes (Iterate Treeview)
+        # Note: Persistent static routes in NM are ipv4.routes "ip/mask gw"
+        # We need to collect them all
+        routes_str = ""
+        for child in self.net_tree.get_children():
+            vals = self.net_tree.item(child)["values"]
+            if vals[0] == "ROUTE":
+                # nmcli format: "192.168.5.0/24 10.0.0.1"
+                routes_str += f"{vals[1]} {vals[2]},"
+        
+        if routes_str:
+            routes_str = routes_str.rstrip(',')
+            commands.append(f"nmcli con mod '{conn_name}' ipv4.routes '{routes_str}'")
+        else:
+            # Clear routes if empty list
+            commands.append(f"nmcli con mod '{conn_name}' ipv4.routes ''")
+
+        # 3. Apply Changes (Up the connection)
+        commands.append(f"nmcli con up '{conn_name}'")
+
+        # Execute as Root
+        full_script = "\n".join(commands)
+        self.log_message(f"Executing nmcli commands...", "INFO")
+        
+        res = self.run_as_root(["sh", "-c", full_script])
+        
+        if res and res.returncode == 0:
+            messagebox.showinfo("Success", "Network configuration applied successfully.")
+            self.log_message("Network config applied.", "INFO")
+        else:
+            err = res.stderr if res else "Unknown Error"
+            messagebox.showerror("Failure", f"Failed to apply settings:\n{err}")
+            self.log_message(f"Net Apply Fail: {err}", "ERROR")
 
     # -------------------------------------------------------------------------
     # TRAY IMPLEMENTATION
@@ -211,12 +536,9 @@ class LivConnectApp:
 
     def build_tray_menu(self):
         menu_items = []
-
-        # Application show/hide
         menu_items.append(pystray.MenuItem("Show LivConnect", self.show_window_from_tray, default=True))
         menu_items.append(pystray.Menu.SEPARATOR)
 
-        # Active Connection Handling
         lbl = "Disconnect"
         if self.connected_profile_name:
             lbl = f"Disconnect ({self.connected_profile_name})"
@@ -224,39 +546,28 @@ class LivConnectApp:
         menu_items.append(pystray.MenuItem(lbl, self.disconnect_vpn_from_tray, enabled=(self.connected_profile_name is not None)))
         menu_items.append(pystray.Menu.SEPARATOR)
 
-        # Forti Group
         forti_subs = []
         if os.path.exists(self.forti_dir):
             for f in sorted(os.listdir(self.forti_dir)):
                 if f.endswith(".vpn"):
                     name = f[:-4]
-                    item = pystray.MenuItem(
-                        name, 
-                        self._tray_action_closure(name, "forti"),
-                        checked=self._tray_check_closure(name)
-                    )
+                    item = pystray.MenuItem(name, self._tray_action_closure(name, "forti"), checked=self._tray_check_closure(name))
                     forti_subs.append(item)
         if forti_subs:
             menu_items.append(pystray.MenuItem("FortiSSL", pystray.Menu(*forti_subs)))
 
-        # IPsec Group
         ipsec_subs = []
         if os.path.exists(self.ipsec_dir):
             for f in sorted(os.listdir(self.ipsec_dir)):
                 if f.endswith(".conf"):
                     name = f[:-5]
-                    item = pystray.MenuItem(
-                        name, 
-                        self._tray_action_closure(name, "ipsec"),
-                        checked=self._tray_check_closure(name)
-                    )
+                    item = pystray.MenuItem(name, self._tray_action_closure(name, "ipsec"), checked=self._tray_check_closure(name))
                     ipsec_subs.append(item)
         if ipsec_subs:
             menu_items.append(pystray.MenuItem("IPsec", pystray.Menu(*ipsec_subs)))
 
         menu_items.append(pystray.Menu.SEPARATOR)
         menu_items.append(pystray.MenuItem("Quit", self.quit_app))
-
         return pystray.Menu(*menu_items)
 
     def init_tray_icon(self):
@@ -265,7 +576,6 @@ class LivConnectApp:
             menu = self.build_tray_menu()
         except Exception:
             menu = pystray.Menu(pystray.MenuItem("Quit", self.quit_app))
-
         self.tray_icon = pystray.Icon("LivConnect", image, "LivConnect VPN", menu=menu)
         self.tray_icon.run()
 
@@ -331,7 +641,6 @@ class LivConnectApp:
             if self.current_process: 
                 self.is_connecting = False
                 return 
-            
             path = os.path.join(current_dir, profile_name + ".vpn")
             try:
                 if IS_MAC:
@@ -438,7 +747,6 @@ class LivConnectApp:
             protocol = self.protocol_var.get()
             
             if protocol == "forti":
-                # DETAILED FORTI TEMPLATE (FULL)
                 forti_template = f"""# LivConnect FortiSSL Configuration
 # Profile: {name}
 
@@ -468,7 +776,6 @@ pppd-use-peerdns = 1           # 1 = Use VPN DNS for lookups
                 with open(os.path.join(current_dir, name + ".vpn"), 'w') as f: f.write(forti_template)
             
             elif protocol == "ipsec":
-                # DETAILED IPSEC TEMPLATE (FULL)
                 conf = f"""# IPsec Configuration for {name}
 # Documentation: https://wiki.strongswan.org/projects/strongswan/wiki/ConnSection
 
@@ -684,7 +991,7 @@ YOUR_USERNAME : EAP "YOUR_PASSWORD"
         about_text = (
             "LivConnect\n"
             "Enterprise VPN Manager\n"
-            "Version 1.0\n\n"
+            "Version 1.5\n\n"
             "Developed by: Liv Yazılım\n\n"
             "This software is proudly developed and distributed by Liv Yazılım "
             "in accordance with the principles of the GNU General Public License (GPL).\n\n"
@@ -730,7 +1037,7 @@ YOUR_USERNAME : EAP "YOUR_PASSWORD"
         s.map("TNotebook.Tab", background=[("selected", "white")], foreground=[("selected", COLOR_PRIMARY)])
 
     def check_local_folders(self):
-        for p in [self.base_dir, self.forti_dir, self.ipsec_dir]:
+        for p in [self.base_dir, self.forti_dir, self.ipsec_dir, self.net_dir]:
             if not os.path.exists(p): os.makedirs(p)
 
     def log_message(self, m, l="INFO"):
@@ -757,7 +1064,7 @@ YOUR_USERNAME : EAP "YOUR_PASSWORD"
             self.editor_conf.delete('1.0', tk.END)
             self.editor_sec.delete('1.0', tk.END)
             if p == "ipsec":
-                self.notebook.add(self.tab2_frame, text="  Secrets (.secrets)  ")
+                self.notebook.add(self.tab2_frame, text="  VPN Secrets (.secrets)  ")
                 self.btn_get_cert.pack_forget()
             else:
                 self.notebook.hide(self.tab2_frame)
@@ -817,6 +1124,26 @@ YOUR_USERNAME : EAP "YOUR_PASSWORD"
             r = subprocess.run(["ipsec", "status"], capture_output=True, text=True)
             return "ESTABLISHED" in r.stdout
         except: return False
+
+    def on_ok(self, e, win, res):
+        res[0] = e.get()
+        win.destroy()
+
+def simple_input(parent, title, prompt):
+    win = tk.Toplevel(parent)
+    win.title(title)
+    win.geometry("300x120")
+    tk.Label(win, text=prompt).pack(pady=10)
+    e = tk.Entry(win)
+    e.pack(pady=5)
+    e.focus_set()
+    res = [None]
+    def on_confirm():
+        res[0] = e.get()
+        win.destroy()
+    tk.Button(win, text="OK", command=on_confirm).pack(pady=10)
+    win.wait_window()
+    return res[0]
 
 if __name__ == "__main__":
     root = tk.Tk()
