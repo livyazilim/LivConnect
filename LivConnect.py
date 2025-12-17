@@ -3,6 +3,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 import os
+import multiprocessing
 import subprocess
 import shutil
 import re
@@ -11,12 +12,51 @@ import platform
 import threading
 import json
 import time
+import sys
+
+if not getattr(sys, 'frozen', False):
+    try:
+        system_site_packages = subprocess.check_output([sys.executable.replace('python', 'python3'), '-c', 
+            'import site; print(site.getsitepackages()[0])']).decode().strip()
+        if system_site_packages and system_site_packages not in sys.path:
+            sys.path.insert(0, system_site_packages)
+    except:
+        pass
 
 # Tray Support
 try:
     import pystray
     from PIL import Image, ImageDraw
     HAS_TRAY = True
+    
+    # xorg backend'de sağ-click menüsü desteği eklemek için subclass oluştur
+    class CustomXorgIcon(pystray._xorg.Icon):
+        """pystray xorg Icon'u sağ-click handler ile extend et"""
+        def __init__(self, *args, **kwargs):
+            self.on_right_click = kwargs.pop('on_right_click', None)
+            self.on_left_click = kwargs.pop('on_left_click', None)
+            super().__init__(*args, **kwargs)
+        
+        def _on_button_press(self, event):
+            """Sağ-click (button 3) ve sol-click (button 1) handler"""
+            if event.detail == 3:  # Sağ buton
+                if self.on_right_click:
+                    self.on_right_click()
+            elif event.detail == 1:  # Sol buton
+                if self.on_left_click:
+                    self.on_left_click()
+                else:
+                    super()._on_button_press(event)
+    
+    # pystray.Icon yerine CustomXorgIcon kullancak way bulmalıyız
+    # Ancak pystray.Icon zaten belirlenmişse, wrapper oluşturalım
+    
+    # xorg backend'de menü gösterme sorunu varsa, workaround ekle
+    try:
+        import pystray._appindicator
+        print("AppIndicator backend available")
+    except (ImportError, Exception) as e:
+        print(f"AppIndicator not available ({e}), using xorg backend")
 except ImportError:
     HAS_TRAY = False
     print("pystray/Pillow module not found. Tray disabled.")
@@ -70,13 +110,19 @@ class LivConnectApp:
         self.active_ipsec_conn = None
         self.is_connecting = False
         self.connected_profile_name = None 
+        
+        # SSH Tunnel State Variables
+        self.ssh_tunnel_process = None
+        self.ssh_tunnel_active = False
+        self.active_ssh_tunnel = None
 
-        # Directories
+        # Directories - use hidden folder in home directory
         self.user_home = os.path.expanduser("~")
-        self.base_dir = os.path.join(self.user_home, "Documents", "LivConnect")
+        self.base_dir = os.path.join(self.user_home, ".livconnect")
         self.forti_dir = os.path.join(self.base_dir, "forti")
         self.ipsec_dir = os.path.join(self.base_dir, "ipsec")
         self.net_dir = os.path.join(self.base_dir, "network_profiles")
+        self.ssh_dir = os.path.join(self.base_dir, "ssh_tunnels")
         self.check_local_folders()
 
         # UI Init
@@ -84,11 +130,14 @@ class LivConnectApp:
         self.create_menu_bar()
         self.setup_ui_components()
 
-        self.log_message(f"LivConnect v1.5 initialized on {SYSTEM_OS}.")
+        self.log_message(f"LivConnect v2.0 initialized on {SYSTEM_OS}.")
         
         # Tray Thread
+        self.tray_update_thread_stop = False
         if HAS_TRAY:
             threading.Thread(target=self.init_tray_icon, daemon=True).start()
+            # Tray menüsünü periyodik olarak güncellemek için thread başlat
+            threading.Thread(target=self._tray_menu_update_loop, daemon=True).start()
 
         # Background Monitor
         self.monitor_vpn_status()
@@ -124,7 +173,13 @@ class LivConnectApp:
         # Header
         header_frame = tk.Frame(self.sidebar_frame, bg=COLOR_SIDEBAR, pady=15)
         header_frame.pack(fill=tk.X, padx=10)
-        tk.Label(header_frame, text="LivConnect", font=("Segoe UI", 18, "bold"), bg=COLOR_SIDEBAR, fg="#1a237e").pack(side=tk.LEFT)
+        
+        title_label = tk.Label(header_frame, text="LivConnect", font=("Segoe UI", 18, "bold"), bg=COLOR_SIDEBAR, fg="#1a237e")
+        title_label.pack(anchor="w")
+        
+        # Subtitle altında
+        subtitle_label = tk.Label(header_frame, text="by Liv Yazılım ve Danışmanlık", font=("Segoe UI", 8), bg=COLOR_SIDEBAR, fg="#999999")
+        subtitle_label.pack(anchor="w")
 
         # MODULE SELECTION
         mod_frame = tk.LabelFrame(self.sidebar_frame, text="Module Select", bg=COLOR_SIDEBAR, pady=10, padx=5, font=("Segoe UI", 9, "bold"))
@@ -136,6 +191,7 @@ class LivConnectApp:
         tk.Radiobutton(mod_frame, text="FortiSSL VPN", variable=self.protocol_var, value="forti", selectcolor=COLOR_PRIMARY, command=self.switch_main_view, **rb_style).pack(fill=tk.X, pady=2)
         tk.Radiobutton(mod_frame, text="IPsec / IKEv2", variable=self.protocol_var, value="ipsec", selectcolor=COLOR_PRIMARY, command=self.switch_main_view, **rb_style).pack(fill=tk.X, pady=2)
         tk.Radiobutton(mod_frame, text="Network Manager", variable=self.protocol_var, value="network", selectcolor=COLOR_NETWORK, command=self.switch_main_view, **rb_style).pack(fill=tk.X, pady=2)
+        tk.Radiobutton(mod_frame, text="🔐 SSH Tunnel", variable=self.protocol_var, value="ssh", selectcolor="#ff5722", command=self.switch_main_view, **rb_style).pack(fill=tk.X, pady=2)
 
         # VPN PROFILE LIST
         self.vpn_list_container = tk.Frame(self.sidebar_frame, bg=COLOR_SIDEBAR)
@@ -193,6 +249,10 @@ class LivConnectApp:
         self.net_view_frame = tk.Frame(self.content_container, bg=COLOR_BG)
         self.setup_network_manager_ui(self.net_view_frame)
 
+        # -- VIEW 3: SSH TUNNEL --
+        self.ssh_view_frame = tk.Frame(self.content_container, bg=COLOR_BG)
+        self.setup_ssh_tunnel_ui(self.ssh_view_frame)
+
         # Logs (Shared)
         self.log_frame = tk.LabelFrame(self.content_container, text="System Logs", font=("Segoe UI", 9, "bold"), bg=COLOR_BG, fg="gray")
         self.log_frame.pack(side=tk.BOTTOM, fill=tk.X, expand=False, pady=(10, 0), ipady=5)
@@ -211,15 +271,23 @@ class LivConnectApp:
     # VIEW SWITCHING LOGIC
     # -------------------------------------------------------------------------
     def switch_main_view(self):
-        """Swaps between VPN Editor and Network Manager views."""
+        """Swaps between VPN Editor, Network Manager, and SSH Tunnel views."""
         mode = self.protocol_var.get()
         
         self.vpn_view_frame.pack_forget()
         self.net_view_frame.pack_forget()
+        self.ssh_view_frame.pack_forget()
 
         if mode == "network":
             # Show Network Manager
             self.net_view_frame.pack(fill=tk.BOTH, expand=True)
+            self.vpn_list_container.pack_forget()
+            self.vpn_btns_frame.pack_forget()
+            # Hide VPN Footer
+            self.action_bar.pack_forget()
+        elif mode == "ssh":
+            # Show SSH Tunnel Manager
+            self.ssh_view_frame.pack(fill=tk.BOTH, expand=True)
             self.vpn_list_container.pack_forget()
             self.vpn_btns_frame.pack_forget()
             # Hide VPN Footer
@@ -267,23 +335,32 @@ class LivConnectApp:
         tk.Radiobutton(iface_frame, text="Automatic (DHCP)", variable=self.ip_mode_var, value="auto", bg="white", font=("Segoe UI", 9), command=self.toggle_ip_inputs).pack(anchor="w")
         tk.Radiobutton(iface_frame, text="Manual (Static IP)", variable=self.ip_mode_var, value="manual", bg="white", font=("Segoe UI", 9), command=self.toggle_ip_inputs).pack(anchor="w")
 
-        # Inputs
+        # Inputs (IP & SUBNET MASK)
         grid_frame = tk.Frame(iface_frame, bg="white")
         grid_frame.pack(fill=tk.X, pady=5, padx=20)
         
+        # IP
         tk.Label(grid_frame, text="IP Address:", bg="white").grid(row=0, column=0, padx=5, sticky="e")
-        self.ent_iface_ip = tk.Entry(grid_frame, width=20)
+        self.ent_iface_ip = tk.Entry(grid_frame, width=15)
         self.ent_iface_ip.grid(row=0, column=1, padx=5)
-        self.ent_iface_ip.insert(0, "192.168.1.150/24")
+        self.ent_iface_ip.insert(0, "192.168.1.150")
 
-        tk.Label(grid_frame, text="Gateway:", bg="white").grid(row=0, column=2, padx=5, sticky="e")
-        self.ent_iface_gw = tk.Entry(grid_frame, width=20)
-        self.ent_iface_gw.grid(row=0, column=3, padx=5)
+        # Subnet Mask (NEW)
+        tk.Label(grid_frame, text="Subnet Mask:", bg="white").grid(row=0, column=2, padx=5, sticky="e")
+        self.ent_iface_subnet = tk.Entry(grid_frame, width=15)
+        self.ent_iface_subnet.grid(row=0, column=3, padx=5)
+        self.ent_iface_subnet.insert(0, "255.255.255.0")
+
+        # Gateway
+        tk.Label(grid_frame, text="Gateway:", bg="white").grid(row=0, column=4, padx=5, sticky="e")
+        self.ent_iface_gw = tk.Entry(grid_frame, width=15)
+        self.ent_iface_gw.grid(row=0, column=5, padx=5)
         self.ent_iface_gw.insert(0, "192.168.1.1")
 
-        tk.Label(grid_frame, text="Primary DNS:", bg="white").grid(row=0, column=4, padx=5, sticky="e")
-        self.ent_iface_dns = tk.Entry(grid_frame, width=20)
-        self.ent_iface_dns.grid(row=0, column=5, padx=5)
+        # DNS
+        tk.Label(grid_frame, text="Primary DNS:", bg="white").grid(row=0, column=6, padx=5, sticky="e")
+        self.ent_iface_dns = tk.Entry(grid_frame, width=15)
+        self.ent_iface_dns.grid(row=0, column=7, padx=5)
         self.ent_iface_dns.insert(0, "8.8.8.8")
 
         self.toggle_ip_inputs() # Set initial state
@@ -338,10 +415,18 @@ class LivConnectApp:
     def toggle_ip_inputs(self):
         state = "normal" if self.ip_mode_var.get() == "manual" else "disabled"
         self.ent_iface_ip.config(state=state)
+        self.ent_iface_subnet.config(state=state) # Updated
         self.ent_iface_gw.config(state=state)
         self.ent_iface_dns.config(state=state)
 
     # --- Network Logic (JSON & Execution) ---
+    def netmask_to_prefix(self, mask):
+        """Converts 255.255.255.0 to 24."""
+        try:
+            return sum([bin(int(x)).count('1') for x in mask.split('.')])
+        except:
+            return 24 # Fallback
+
     def refresh_net_profiles(self):
         if not os.path.exists(self.net_dir): os.makedirs(self.net_dir)
         files = [f.replace(".json", "") for f in os.listdir(self.net_dir) if f.endswith(".json")]
@@ -354,7 +439,7 @@ class LivConnectApp:
             # Default structure
             default_data = {
                 "mode": "auto",
-                "ip": "", "gateway": "", "dns": "",
+                "ip": "", "subnet": "255.255.255.0", "gateway": "", "dns": "", # Updated default
                 "routes": []
             }
             with open(path, 'w') as f: json.dump(default_data, f)
@@ -384,6 +469,7 @@ class LivConnectApp:
         data = {
             "mode": self.ip_mode_var.get(),
             "ip": self.ent_iface_ip.get(),
+            "subnet": self.ent_iface_subnet.get(), # Updated
             "gateway": self.ent_iface_gw.get(),
             "dns": self.ent_iface_dns.get(),
             "routes": routes
@@ -408,6 +494,9 @@ class LivConnectApp:
                 # Load Inputs
                 self.ent_iface_ip.delete(0, tk.END)
                 self.ent_iface_ip.insert(0, data.get("ip", ""))
+                
+                self.ent_iface_subnet.delete(0, tk.END) # Updated
+                self.ent_iface_subnet.insert(0, data.get("subnet", "")) # Updated
                 
                 self.ent_iface_gw.delete(0, tk.END)
                 self.ent_iface_gw.insert(0, data.get("gateway", ""))
@@ -460,12 +549,22 @@ class LivConnectApp:
         # 1. Interface Configuration
         if self.ip_mode_var.get() == "manual":
             ip = self.ent_iface_ip.get()
+            subnet_input = self.ent_iface_subnet.get() # Get Mask string
             gw = self.ent_iface_gw.get()
             dns = self.ent_iface_dns.get()
             
+            # Convert Mask to Prefix (if not already)
+            if "." in subnet_input:
+                prefix = self.netmask_to_prefix(subnet_input)
+            else:
+                prefix = subnet_input # Fallback if user typed 24
+
+            # Combine for nmcli
+            full_ip = f"{ip}/{prefix}"
+            
             # Set Manual
             commands.append(f"nmcli con mod '{conn_name}' ipv4.method manual")
-            commands.append(f"nmcli con mod '{conn_name}' ipv4.addresses {ip}")
+            commands.append(f"nmcli con mod '{conn_name}' ipv4.addresses {full_ip}")
             commands.append(f"nmcli con mod '{conn_name}' ipv4.gateway {gw}")
             commands.append(f"nmcli con mod '{conn_name}' ipv4.dns {dns}")
         else:
@@ -525,17 +624,128 @@ class LivConnectApp:
         return image
 
     def _tray_action_closure(self, profile_name, protocol):
-        def callback(icon, item):
-            self.connect_vpn_from_tray(profile_name, protocol)
+        def callback(icon=None, item=None):
+            try:
+                self.connect_vpn_from_tray(profile_name, protocol)
+            except Exception as e:
+                print(f"Tray action error: {e}")
         return callback
 
     def _tray_check_closure(self, profile_name):
-        def callback(item):
+        def callback(item=None):
             return self.connected_profile_name == profile_name
         return callback
 
+    def _tray_ssh_action_closure(self, profile_name):
+        """Closure for SSH tunnel tray menu actions"""
+        def callback(icon=None, item=None):
+            try:
+                self.root.after(0, lambda pn=profile_name: self._connect_ssh_tunnel_tray(pn))
+            except Exception as e:
+                import traceback
+                print(f"Tray SSH action error: {e}")
+                traceback.print_exc()
+        return callback
+
+    def connect_ssh_tunnel_from_tray(self, profile_name):
+        """Connect SSH tunnel from tray menu"""
+        self.root.after(0, lambda: self._connect_ssh_tunnel_tray(profile_name))
+
+    def _connect_ssh_tunnel_tray(self, profile_name):
+        """Actually connect SSH tunnel (called from main thread)"""
+        try:
+            if self.ssh_tunnel_active:
+                messagebox.showwarning("Status", "SSH tunnel already active. Disconnect first.")
+                return
+            
+            # Load profile
+            path = os.path.join(self.ssh_dir, profile_name + ".json")
+            if not os.path.exists(path):
+                messagebox.showerror("Error", f"SSH profile not found: {profile_name}")
+                return
+            
+            with open(path, 'r') as f:
+                profile = json.load(f)
+            
+            # Set UI fields from profile
+            if hasattr(self, 'ssh_profile_combo') and self.ssh_profile_combo is not None:
+                self.ssh_profile_combo.set(profile_name)
+            
+            if hasattr(self, 'ssh_host_entry') and self.ssh_host_entry is not None:
+                self.ssh_host_entry.delete(0, tk.END)
+                self.ssh_host_entry.insert(0, profile.get("host", ""))
+            
+            if hasattr(self, 'ssh_port_entry') and self.ssh_port_entry is not None:
+                self.ssh_port_entry.delete(0, tk.END)
+                self.ssh_port_entry.insert(0, profile.get("port", "22"))
+            
+            if hasattr(self, 'ssh_user_entry') and self.ssh_user_entry is not None:
+                self.ssh_user_entry.delete(0, tk.END)
+                self.ssh_user_entry.insert(0, profile.get("user", ""))
+            
+            if hasattr(self, 'ssh_auth_var') and self.ssh_auth_var is not None:
+                auth_type = profile.get("auth_type", "password")
+                self.ssh_auth_var.set(auth_type)
+            
+            if hasattr(self, 'ssh_pass_entry') and self.ssh_pass_entry is not None:
+                self.ssh_pass_entry.delete(0, tk.END)
+                self.ssh_pass_entry.insert(0, profile.get("password", ""))
+            
+            if hasattr(self, 'ssh_key_entry') and self.ssh_key_entry is not None:
+                self.ssh_key_entry.delete(0, tk.END)
+                self.ssh_key_entry.insert(0, profile.get("key_file", ""))
+            
+            # Switch to SSH module if UI available
+            if hasattr(self, 'protocol_var') and self.protocol_var is not None:
+                self.protocol_var.set("ssh")
+                self.switch_main_view()
+            
+            # Start tunnel
+            self.start_ssh_tunnel()
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to connect SSH tunnel: {str(e)}")
+            import traceback
+            self.log_message(f"Error connecting SSH tunnel: {str(e)}\n{traceback.format_exc()}", "ERROR")
+            # Show window
+            self.root.after(100, self._restore_window)
+            
+            # Start tunnel
+            self.root.after(200, self.start_ssh_tunnel)
+        
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to connect SSH tunnel: {str(e)}")
+            self.log_message(f"Error connecting SSH tunnel from tray: {str(e)}", "ERROR")
+
+    def show_ssh_manager_from_tray(self):
+        """Show SSH manager from tray"""
+        self.root.after(0, lambda: self._show_ssh_manager_tray())
+
+    def _show_ssh_manager_tray(self):
+        """Actually show SSH manager (called from main thread)"""
+        # Switch to SSH module
+        self.protocol_var.set("ssh")
+        self.switch_main_view()
+        
+        # Show window
+        self._restore_window()
+
+    def disconnect_ssh_tunnel_from_tray(self):
+        """Disconnect SSH tunnel from tray menu"""
+        if not self.ssh_tunnel_active:
+            messagebox.showwarning("Status", "SSH tunnel not active")
+            return
+        
+        try:
+            self.stop_ssh_tunnel()
+            messagebox.showinfo("Success", "SSH tunnel disconnected")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to disconnect SSH tunnel: {str(e)}")
+            self.log_message(f"Error disconnecting SSH tunnel from tray: {str(e)}", "ERROR")
+
     def build_tray_menu(self):
         menu_items = []
+        # Sol-click: window açılır, sağ-click: bu menü açılır
         menu_items.append(pystray.MenuItem("Show LivConnect", self.show_window_from_tray, default=True))
         menu_items.append(pystray.Menu.SEPARATOR)
 
@@ -566,18 +776,83 @@ class LivConnectApp:
         if ipsec_subs:
             menu_items.append(pystray.MenuItem("IPsec", pystray.Menu(*ipsec_subs)))
 
+        # SSH Tunnel
+        ssh_subs = []
+        ssh_status_label = "SSH Tunnel"
+        if self.ssh_tunnel_active:
+            ssh_status_label = f"🔐 SSH Tunnel (Connected)"
+        if os.path.exists(self.ssh_dir):
+            for f in sorted(os.listdir(self.ssh_dir)):
+                if f.endswith(".json"):
+                    name = f[:-5]
+                    checked = lambda n=name: (self.active_ssh_tunnel == n)
+                    ssh_subs.append(pystray.MenuItem(name, self._tray_ssh_action_closure(name), checked=checked))
+        if ssh_subs:
+            ssh_subs.append(pystray.Menu.SEPARATOR)
+            ssh_subs.append(pystray.MenuItem("Disconnect SSH", lambda: self.root.after(0, self.disconnect_ssh_tunnel_from_tray), enabled=self.ssh_tunnel_active))
+            menu_items.append(pystray.MenuItem(ssh_status_label, pystray.Menu(*ssh_subs)))
+
         menu_items.append(pystray.Menu.SEPARATOR)
         menu_items.append(pystray.MenuItem("Quit", self.quit_app))
         return pystray.Menu(*menu_items)
 
     def init_tray_icon(self):
+        # Debug log dosyası
+        debug_log = os.path.join(self.base_dir, "tray_debug.log")
+        
+        def log_debug(msg):
+            with open(debug_log, 'a') as f:
+                f.write(f"[{datetime.datetime.now()}] {msg}\n")
+            print(msg)
+        
+        log_debug("=== Starting tray initialization ===")
+        
         image = self.create_tray_image()
         try:
             menu = self.build_tray_menu()
-        except Exception:
+            log_debug(f"Menu created successfully with items")
+        except Exception as e:
+            log_debug(f"Menu build error: {e}")
+            import traceback
+            log_debug(traceback.format_exc())
             menu = pystray.Menu(pystray.MenuItem("Quit", self.quit_app))
-        self.tray_icon = pystray.Icon("LivConnect", image, "LivConnect VPN", menu=menu)
-        self.tray_icon.run()
+        
+        # Tray ikonunu oluştur - menü parametresi ile
+        try:
+            # xorg backend ise CustomXorgIcon kullan
+            if 'xorg' in pystray.Icon.__module__.lower():
+                self.tray_icon = CustomXorgIcon(
+                    "LivConnect", 
+                    image, 
+                    "LivConnect VPN - Left-click to open, Right-click for menu", 
+                    menu=menu,
+                    on_left_click=self.show_window_from_tray,
+                    on_right_click=self.show_tray_context_menu
+                )
+                log_debug("Tray icon created with CustomXorgIcon (left & right-click handlers enabled)")
+            else:
+                self.tray_icon = pystray.Icon(
+                    "LivConnect", 
+                    image, 
+                    "LivConnect VPN - Right-click for menu", 
+                    menu=menu
+                )
+                log_debug("Tray icon created with standard pystray.Icon")
+        except Exception as e:
+            log_debug(f"Tray icon creation error: {e}")
+            import traceback
+            log_debug(traceback.format_exc())
+            return
+        
+        log_debug(f"Tray icon backend: {type(self.tray_icon).__module__}")
+        
+        try:
+            log_debug("Running tray icon...")
+            self.tray_icon.run()
+        except Exception as e:
+            log_debug(f"Tray icon run error: {e}")
+            import traceback
+            log_debug(traceback.format_exc())
 
     def update_tray_menu(self):
         if hasattr(self, 'tray_icon') and self.tray_icon.visible:
@@ -588,11 +863,39 @@ class LivConnectApp:
     def connect_vpn_from_tray(self, profile_name, protocol):
         self.root.after(0, lambda: self.connect_vpn(profile_name, protocol))
 
-    def disconnect_vpn_from_tray(self, icon, item):
-        self.root.after(0, self.disconnect_vpn)
+    def disconnect_vpn_from_tray(self, icon=None, item=None):
+        try:
+            self.root.after(0, self.disconnect_vpn)
+        except Exception as e:
+            print(f"Disconnect tray error: {e}")
 
-    def show_window_from_tray(self, icon, item):
-        self.root.after(0, self._restore_window)
+    def show_window_from_tray(self, icon=None, item=None):
+        try:
+            # Show LivConnect window (callable from left-click)
+            self.root.after(0, self._restore_window)
+        except Exception as e:
+            print(f"Show window tray error: {e}")
+
+    def _tray_menu_update_loop(self):
+        """Tray menüsünü periyodik olarak güncelle"""
+        import time
+        import traceback
+        debug_log = os.path.join(self.base_dir, "tray_debug.log")
+        
+        while not self.tray_update_thread_stop:
+            try:
+                if hasattr(self, 'tray_icon') and self.tray_icon is not None and self.tray_icon.visible:
+                    new_menu = self.build_tray_menu()
+                    # Menüyü doğrudan ata (daha sonra update_menu ile güncelle)
+                    self.tray_icon.menu = new_menu
+                    # update_menu() parametresiz çağır - dinamik menü öğelerini yenile
+                    if hasattr(self.tray_icon, 'update_menu'):
+                        self.tray_icon.update_menu()
+            except Exception as e:
+                with open(debug_log, 'a') as f:
+                    f.write(f"[{datetime.datetime.now()}] Tray update error: {str(e)}\n")
+                    f.write(traceback.format_exc())
+            time.sleep(2)  # Her 2 saniyede güncelle
 
     def _restore_window(self):
         self.root.deiconify()
@@ -600,6 +903,81 @@ class LivConnectApp:
         try: self.root.focus_force()
         except: pass
         self.is_minimized = False
+
+    def show_tray_context_menu(self, x=None, y=None):
+        """Tray context menüsünü Tkinter popup menu'yle göster"""
+        if x is None or y is None:
+            # İmleçin konumunu al
+            try:
+                x = self.root.winfo_pointerx()
+                y = self.root.winfo_pointery()
+            except:
+                x = 100
+                y = 100
+        
+        # Tray menüsü
+        tray_menu = tk.Menu(self.root, tearoff=0, bg=COLOR_SIDEBAR, fg=COLOR_TEXT)
+        tray_menu.add_command(label="Show LivConnect", command=self._restore_window)
+        tray_menu.add_separator()
+        
+        # Disconnect seçeneği
+        lbl = "Disconnect"
+        if self.connected_profile_name:
+            lbl = f"Disconnect ({self.connected_profile_name})"
+        if self.connected_profile_name:
+            tray_menu.add_command(label=lbl, command=self.disconnect_vpn)
+        else:
+            tray_menu.add_command(label=lbl, state="disabled")
+        
+        tray_menu.add_separator()
+        
+        # FortiSSL submenu
+        if os.path.exists(self.forti_dir):
+            forti_files = [f[:-4] for f in sorted(os.listdir(self.forti_dir)) if f.endswith(".vpn")]
+            if forti_files:
+                forti_submenu = tk.Menu(tray_menu, tearoff=0, bg=COLOR_SIDEBAR, fg=COLOR_TEXT)
+                for name in forti_files:
+                    forti_submenu.add_command(
+                        label=name, 
+                        command=lambda n=name: self.connect_vpn(n, "forti")
+                    )
+                tray_menu.add_cascade(label="FortiSSL", menu=forti_submenu)
+        
+        # IPsec submenu
+        if os.path.exists(self.ipsec_dir):
+            ipsec_files = [f[:-5] for f in sorted(os.listdir(self.ipsec_dir)) if f.endswith(".conf")]
+            if ipsec_files:
+                ipsec_submenu = tk.Menu(tray_menu, tearoff=0, bg=COLOR_SIDEBAR, fg=COLOR_TEXT)
+                for name in ipsec_files:
+                    ipsec_submenu.add_command(
+                        label=name,
+                        command=lambda n=name: self.connect_vpn(n, "ipsec")
+                    )
+                tray_menu.add_cascade(label="IPsec", menu=ipsec_submenu)
+        
+        # SSH Tunnel submenu
+        if os.path.exists(self.ssh_dir):
+            ssh_files = [f[:-5] for f in sorted(os.listdir(self.ssh_dir)) if f.endswith(".json")]
+            if ssh_files:
+                ssh_submenu = tk.Menu(tray_menu, tearoff=0, bg=COLOR_SIDEBAR, fg=COLOR_TEXT)
+                for name in ssh_files:
+                    ssh_submenu.add_command(
+                        label=name,
+                        command=lambda n=name: self.connect_ssh_tunnel_from_tray(n)
+                    )
+                ssh_submenu.add_separator()
+                ssh_submenu.add_command(label="Disconnect SSH", command=self.disconnect_ssh_tunnel_from_tray, state="normal" if self.ssh_tunnel_active else "disabled")
+                ssh_status = "🔐 SSH Tunnel (Connected)" if self.ssh_tunnel_active else "🔐 SSH Tunnel"
+                tray_menu.add_cascade(label=ssh_status, menu=ssh_submenu)
+        
+        tray_menu.add_separator()
+        tray_menu.add_command(label="Quit", command=self.quit_app)
+        
+        # Menüyü göster
+        try:
+            tray_menu.tk_popup(x, y)
+        except:
+            pass
 
     def on_closing(self):
         if HAS_TRAY:
@@ -609,11 +987,12 @@ class LivConnectApp:
                 except: pass
                 self.is_minimized = True
         else:
-            if messagebox.askokcancel("Quit", "Exit LivConnect?"):
+            if messagebox.askokcancel("Quit", "Exit LivConnect? (VPN will stay active)"):
                 self.quit_app()
 
     def quit_app(self, icon=None, item=None):
-        self.disconnect_vpn()
+        #self.disconnect_vpn()
+        self.tray_update_thread_stop = True  # Tray update thread'ini durdur
         if hasattr(self, 'tray_icon'):
             self.tray_icon.stop()
         self.root.quit()
@@ -644,7 +1023,9 @@ class LivConnectApp:
             path = os.path.join(current_dir, profile_name + ".vpn")
             try:
                 if IS_MAC:
-                    safe_cmd = f'openfortivpn -c "{path}"'
+                    # macOS: Escape path for AppleScript
+                    escaped_path = path.replace('"', '\\"')
+                    safe_cmd = f'openfortivpn -c "{escaped_path}"'
                     self.current_process = subprocess.Popen(["osascript", "-e", f'do shell script "{safe_cmd}" with administrator privileges'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 else:
                     self.current_process = subprocess.Popen(["pkexec", "openfortivpn", "-c", path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -666,13 +1047,11 @@ class LivConnectApp:
                 self.log_message("Connection name not found.", "ERROR")
                 return
             
-            if self.run_as_root(["ipsec", "update"]).returncode != 0:
-                self.set_status("Update Failed", "error")
-                self.is_connecting = False
-                return
+            # Toplu ipsec komutlarını tek seferde çalıştır - şifre 1 kez soruluyor
+            combined_cmd = ["sh", "-c", f"ipsec update && ipsec up {conn_name}"]
+            res = self.run_as_root(combined_cmd)
             
-            res = self.run_as_root(["ipsec", "up", conn_name])
-            if res.returncode == 0:
+            if res and res.returncode == 0:
                 self.current_process = None 
                 self.active_ipsec_conn = conn_name
                 self.connected_profile_name = profile_name 
@@ -681,28 +1060,55 @@ class LivConnectApp:
                 self.toggle_buttons(True)
             else:
                 self.set_status("Error", "error")
-                self.log_message(res.stderr + res.stdout, "ERROR")
+                if res:
+                    self.log_message(res.stderr + res.stdout, "ERROR")
         
         self.is_connecting = False
         self.update_tray_menu()
 
     def disconnect_vpn(self):
-        if self.current_process:
-            if IS_MAC: subprocess.run(["usr/bin/pkill", "openfortivpn"])
-            else: subprocess.run(["pkexec", "kill", str(self.current_process.pid)])
-            self.current_process = None
-            
-        elif self.active_ipsec_conn:
-            self.run_as_root(["ipsec", "down", self.active_ipsec_conn])
-            self.active_ipsec_conn = None
+        """Terminates the VPN connection forcefully and with proper privileges."""
+        self.log_message("Sending disconnect command...", "WARN")
         
         try:
+            if IS_MAC:
+                # macOS: Use osascript to send a privileged pkill -9 command
+                cmd = '/usr/bin/pkill -9 openfortivpn'
+                subprocess.run(["osascript", "-e", f'do shell script "{cmd}" with administrator privileges'])
+                if hasattr(self, 'active_ipsec_conn') and self.active_ipsec_conn:
+                    ipsec_cmd = f'ipsec down {self.active_ipsec_conn}'
+                    subprocess.run(["osascript", "-e", f'do shell script "{ipsec_cmd}" with administrator privileges'])
+                    self.active_ipsec_conn = None
+            else:
+                # Linux: Toplu komut - şifre sadece 1 kez soruluyor
+                if hasattr(self, 'active_ipsec_conn') and self.active_ipsec_conn:
+                    # IPsec aktif ise: pkill + ipsec down toplu yapılır
+                    combined_cmd = ["sh", "-c", f"pkill -9 openfortivpn; ipsec down {self.active_ipsec_conn}"]
+                    self.run_as_root(combined_cmd)
+                    self.active_ipsec_conn = None
+                else:
+                    # Sadece FortiVPN açık ise
+                    subprocess.run(["pkexec", "pkill", "-9", "openfortivpn"])
+
+            # Clean up the Python process object if it exists
+            if hasattr(self, 'current_process') and self.current_process:
+                try:
+                    # Use kill() instead of terminate() for a non-catchable signal
+                    self.current_process.kill()
+                except:
+                    pass
+                self.current_process = None
+
+            # Update UI state to reflect the disconnection
             self.connected_profile_name = None
             self.set_status("Ready", "ready")
             self.toggle_buttons(False)
             self.update_tray_menu()
-        except: pass
-
+            self.log_message("VPN process terminated.", "INFO")
+            
+        except Exception as e:
+            self.log_message(f"Disconnection error: {str(e)}", "ERROR")
+            
     def monitor_vpn_status(self):
         if self.is_connecting:
             self.root.after(3000, self.monitor_vpn_status)
@@ -969,10 +1375,13 @@ YOUR_USERNAME : EAP "YOUR_PASSWORD"
         c = " ".join(cmd)
         try:
             if IS_MAC:
-                return subprocess.run(["osascript", "-e", f'do shell script "{c}" with administrator privileges'], capture_output=True, text=True)
+                # macOS: Escape quotes for AppleScript
+                escaped_cmd = c.replace('"', '\\"')
+                return subprocess.run(["osascript", "-e", f'do shell script "{escaped_cmd}" with administrator privileges'], capture_output=True, text=True)
             else:
                 return subprocess.run(["pkexec"] + cmd, capture_output=True, text=True)
-        except: return None
+        except: 
+            return None
 
     # --- STANDARD HELPERS ---
     def create_menu_bar(self):
@@ -991,7 +1400,7 @@ YOUR_USERNAME : EAP "YOUR_PASSWORD"
         about_text = (
             "LivConnect\n"
             "Enterprise VPN Manager\n"
-            "Version 1.5\n\n"
+            "Version 2.0\n\n"
             "Developed by: Liv Yazılım\n\n"
             "This software is proudly developed and distributed by Liv Yazılım "
             "in accordance with the principles of the GNU General Public License (GPL).\n\n"
@@ -1125,6 +1534,581 @@ YOUR_USERNAME : EAP "YOUR_PASSWORD"
             return "ESTABLISHED" in r.stdout
         except: return False
 
+    # -------------------------------------------------------------------------
+    # SSH TUNNEL UI SETUP
+    # -------------------------------------------------------------------------
+    def setup_ssh_tunnel_ui(self, parent):
+        """Setup SSH Tunnel interface in the tab"""
+        parent.configure(bg="white")
+        
+        # Header
+        header = tk.Frame(parent, bg="white", pady=10)
+        header.pack(fill=tk.X, padx=10)
+        tk.Label(header, text="SSH Tunnel Manager", font=("Segoe UI", 14, "bold"), fg="#1976d2", bg="white").pack(side=tk.LEFT)
+        
+        # Profile Selection Frame
+        prof_frame = tk.LabelFrame(parent, text="Profiles", bg="white", padx=10, pady=10, font=("Segoe UI", 9, "bold"))
+        prof_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        tk.Label(prof_frame, text="Select Profile:", bg="white").pack(side=tk.LEFT, padx=5)
+        self.ssh_profile_combo = ttk.Combobox(prof_frame, width=25, state="readonly")
+        self.ssh_profile_combo.pack(side=tk.LEFT, padx=5)
+        self.ssh_profile_combo.bind("<<ComboboxSelected>>", self.load_ssh_profile)
+        
+        tk.Button(prof_frame, text="➕ New", bg="#e0e0e0", command=self.create_ssh_profile, cursor="hand2").pack(side=tk.LEFT, padx=2)
+        tk.Button(prof_frame, text="💾 Save", bg="#c8e6c9", command=self.save_ssh_profile, cursor="hand2").pack(side=tk.LEFT, padx=2)
+        tk.Button(prof_frame, text="🗑️ Delete", bg="#ffcdd2", command=self.delete_ssh_profile, cursor="hand2").pack(side=tk.LEFT, padx=2)
+        
+        # SSH Connection Settings
+        conn_frame = tk.LabelFrame(parent, text="Connection Settings", bg="white", padx=15, pady=10, font=("Segoe UI", 9, "bold"))
+        conn_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        # Row 1: Host & Port
+        r1 = tk.Frame(conn_frame, bg="white")
+        r1.pack(fill=tk.X, pady=3)
+        tk.Label(r1, text="SSH Host:", bg="white", width=15, anchor="e").pack(side=tk.LEFT, padx=5)
+        self.ssh_host_entry = tk.Entry(r1, width=25, font=("Segoe UI", 10))
+        self.ssh_host_entry.pack(side=tk.LEFT, padx=5)
+        tk.Label(r1, text="Port:", bg="white", width=8, anchor="e").pack(side=tk.LEFT, padx=5)
+        self.ssh_port_entry = tk.Entry(r1, width=8, font=("Segoe UI", 10))
+        self.ssh_port_entry.insert(0, "22")
+        self.ssh_port_entry.pack(side=tk.LEFT, padx=5)
+        
+        # Row 2: Username & Auth Type
+        r2 = tk.Frame(conn_frame, bg="white")
+        r2.pack(fill=tk.X, pady=3)
+        tk.Label(r2, text="SSH User:", bg="white", width=15, anchor="e").pack(side=tk.LEFT, padx=5)
+        self.ssh_user_entry = tk.Entry(r2, width=25, font=("Segoe UI", 10))
+        self.ssh_user_entry.pack(side=tk.LEFT, padx=5)
+        tk.Label(r2, text="Auth:", bg="white", width=8, anchor="e").pack(side=tk.LEFT, padx=5)
+        self.ssh_auth_var = tk.StringVar(value="password")
+        auth_combo = ttk.Combobox(r2, textvariable=self.ssh_auth_var, values=["password", "key"], width=10, state="readonly")
+        auth_combo.pack(side=tk.LEFT, padx=5)
+        auth_combo.bind("<<ComboboxSelected>>", self.toggle_ssh_auth_fields)
+        
+        # Row 3: Password / Key File
+        r3 = tk.Frame(conn_frame, bg="white")
+        r3.pack(fill=tk.X, pady=3)
+        tk.Label(r3, text="Password:", bg="white", width=15, anchor="e").pack(side=tk.LEFT, padx=5)
+        self.ssh_pass_entry = tk.Entry(r3, width=25, show="●", font=("Segoe UI", 10))
+        self.ssh_pass_entry.pack(side=tk.LEFT, padx=5)
+        
+        # Row 4: Key File (hidden by default)
+        r4 = tk.Frame(conn_frame, bg="white")
+        r4.pack(fill=tk.X, pady=3)
+        tk.Label(r4, text="Key File:", bg="white", width=15, anchor="e").pack(side=tk.LEFT, padx=5)
+        self.ssh_key_entry = tk.Entry(r4, width=25, font=("Segoe UI", 10))
+        self.ssh_key_entry.pack(side=tk.LEFT, padx=5)
+        tk.Button(r4, text="Browse", bg="#e3f2fd", command=self.browse_ssh_key, cursor="hand2").pack(side=tk.LEFT, padx=2)
+        
+        # Hide key file row initially
+        self.ssh_key_row = r4
+        r4.pack_forget()
+        
+        # Tunnel Configuration Frame
+        tunnel_frame = tk.LabelFrame(parent, text="Tunnel Configuration", bg="white", padx=15, pady=10, font=("Segoe UI", 9, "bold"))
+        tunnel_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        # Port Forwarding Rules
+        tk.Label(tunnel_frame, text="Port Forwarding Rules:", bg="white", font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=0, pady=(0, 5))
+        
+        # Add Port Forward
+        pfr = tk.Frame(tunnel_frame, bg="white")
+        pfr.pack(fill=tk.X, pady=3)
+        tk.Label(pfr, text="Local Port:", bg="white", width=15, anchor="e").pack(side=tk.LEFT, padx=5)
+        self.ssh_local_port_entry = tk.Entry(pfr, width=10, font=("Segoe UI", 10))
+        self.ssh_local_port_entry.pack(side=tk.LEFT, padx=5)
+        tk.Label(pfr, text="→", bg="white").pack(side=tk.LEFT)
+        tk.Label(pfr, text="Remote Host:", bg="white", width=12, anchor="e").pack(side=tk.LEFT, padx=5)
+        self.ssh_remote_host_entry = tk.Entry(pfr, width=20, font=("Segoe UI", 10))
+        self.ssh_remote_host_entry.pack(side=tk.LEFT, padx=5)
+        tk.Label(pfr, text="Remote Port:", bg="white", width=12, anchor="e").pack(side=tk.LEFT, padx=5)
+        self.ssh_remote_port_entry = tk.Entry(pfr, width=10, font=("Segoe UI", 10))
+        self.ssh_remote_port_entry.pack(side=tk.LEFT, padx=5)
+        tk.Button(pfr, text="Add", bg="#bbdefb", command=self.add_ssh_port_forward, cursor="hand2").pack(side=tk.LEFT, padx=5)
+        
+        # Port Forwarding List
+        list_frame = tk.Frame(tunnel_frame, bg="white")
+        list_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        tk.Label(list_frame, text="Active Rules:", bg="white", font=("Segoe UI", 8, "bold")).pack(anchor="w")
+        
+        columns = ("local", "remote_host", "remote_port", "action")
+        self.ssh_forward_tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=4)
+        self.ssh_forward_tree.heading("local", text="Local Port")
+        self.ssh_forward_tree.heading("remote_host", text="Remote Host")
+        self.ssh_forward_tree.heading("remote_port", text="Remote Port")
+        self.ssh_forward_tree.heading("action", text="Action")
+        self.ssh_forward_tree.column("local", width=80)
+        self.ssh_forward_tree.column("remote_host", width=150)
+        self.ssh_forward_tree.column("remote_port", width=80)
+        self.ssh_forward_tree.column("action", width=60)
+        self.ssh_forward_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.ssh_forward_tree.yview)
+        self.ssh_forward_tree.configure(yscroll=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Remove button
+        tk.Button(tunnel_frame, text="Remove Selected Rule", bg="#ffcdd2", command=self.remove_ssh_port_forward, cursor="hand2").pack(pady=5)
+        
+        # Status & Actions
+        status_frame = tk.Frame(parent, bg="white", pady=10)
+        status_frame.pack(fill=tk.X, padx=10)
+        
+        self.ssh_status_canvas = tk.Canvas(status_frame, width=20, height=20, bg="white", highlightthickness=0)
+        self.ssh_status_canvas.pack(side=tk.LEFT, padx=5)
+        self.ssh_status_circle = self.ssh_status_canvas.create_oval(2, 2, 18, 18, fill="#bdbdbd", outline="")
+        
+        self.ssh_status_label = tk.Label(status_frame, text="Status: Disconnected", bg="white", font=("Segoe UI", 10))
+        self.ssh_status_label.pack(side=tk.LEFT, padx=5)
+        
+        # Action Buttons
+        btn_frame = tk.Frame(parent, bg="white", pady=10)
+        btn_frame.pack(fill=tk.X, padx=10)
+        
+        self.ssh_connect_btn = tk.Button(btn_frame, text="▶ CONNECT TUNNEL", bg=COLOR_SUCCESS, fg="white", font=("Segoe UI", 11, "bold"), bd=0, padx=20, pady=10, command=self.start_ssh_tunnel, cursor="hand2")
+        self.ssh_connect_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.ssh_disconnect_btn = tk.Button(btn_frame, text="■ DISCONNECT TUNNEL", bg=COLOR_DANGER, fg="white", font=("Segoe UI", 11, "bold"), bd=0, padx=20, pady=10, command=self.stop_ssh_tunnel, state="disabled", cursor="hand2")
+        self.ssh_disconnect_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.ssh_terminal_btn = tk.Button(btn_frame, text="🖥️ OPEN TERMINAL", bg="#2196f3", fg="white", font=("Segoe UI", 11, "bold"), bd=0, padx=20, pady=10, command=self.open_ssh_terminal, state="disabled", cursor="hand2")
+        self.ssh_terminal_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Refresh profiles
+        self.refresh_ssh_profiles()
+
+    def toggle_ssh_auth_fields(self, event=None):
+        """Show/hide password or key file based on auth type"""
+        if self.ssh_auth_var.get() == "key":
+            self.ssh_pass_entry.pack_forget()
+            self.ssh_key_row.pack(fill=tk.X, pady=3)
+        else:
+            self.ssh_key_row.pack_forget()
+            self.ssh_pass_entry.pack(side=tk.LEFT, padx=5)
+
+    def browse_ssh_key(self):
+        """Open file dialog to select SSH key"""
+        from tkinter import filedialog
+        filename = filedialog.askopenfilename(title="Select SSH Key", filetypes=[("PEM files", "*.pem"), ("All files", "*.*")])
+        if filename:
+            self.ssh_key_entry.delete(0, tk.END)
+            self.ssh_key_entry.insert(0, filename)
+
+    def add_ssh_port_forward(self):
+        """Add port forwarding rule to the tree"""
+        local_port = self.ssh_local_port_entry.get()
+        remote_host = self.ssh_remote_host_entry.get()
+        remote_port = self.ssh_remote_port_entry.get()
+        
+        if not all([local_port, remote_host, remote_port]):
+            messagebox.showwarning("Validation", "Please fill all port forwarding fields")
+            return
+        
+        try:
+            int(local_port)
+            int(remote_port)
+        except ValueError:
+            messagebox.showerror("Error", "Ports must be numeric values")
+            return
+        
+        # Add to tree
+        self.ssh_forward_tree.insert("", tk.END, values=(local_port, remote_host, remote_port, "Remove"))
+        
+        # Clear inputs
+        self.ssh_local_port_entry.delete(0, tk.END)
+        self.ssh_remote_host_entry.delete(0, tk.END)
+        self.ssh_remote_port_entry.delete(0, tk.END)
+
+    def remove_ssh_port_forward(self):
+        """Remove selected port forwarding rule"""
+        selected = self.ssh_forward_tree.selection()
+        for item in selected:
+            self.ssh_forward_tree.delete(item)
+
+    def refresh_ssh_profiles(self):
+        """Refresh SSH profile list"""
+        if not os.path.exists(self.ssh_dir):
+            os.makedirs(self.ssh_dir)
+        files = [f.replace(".json", "") for f in os.listdir(self.ssh_dir) if f.endswith(".json")]
+        self.ssh_profile_combo['values'] = sorted(files)
+        if files:
+            self.ssh_profile_combo.set(files[0])
+            self.load_ssh_profile(None)
+
+    def create_ssh_profile(self):
+        """Create new SSH tunnel profile"""
+        name = simple_input(self.root, "New SSH Tunnel", "Profile Name:")
+        if name:
+            path = os.path.join(self.ssh_dir, name + ".json")
+            if os.path.exists(path):
+                messagebox.showerror("Error", "Profile already exists")
+                return
+            
+            default_profile = {
+                "host": "",
+                "port": "22",
+                "user": "",
+                "auth_type": "password",
+                "password": "",
+                "key_file": "",
+                "port_forwards": []
+            }
+            with open(path, 'w') as f:
+                json.dump(default_profile, f, indent=2)
+            
+            self.refresh_ssh_profiles()
+            self.ssh_profile_combo.set(name)
+            self.load_ssh_profile(None)
+            self.log_message(f"SSH profile created: {name}", "INFO")
+
+    def load_ssh_profile(self, event):
+        """Load SSH profile from file"""
+        profile_name = self.ssh_profile_combo.get()
+        if not profile_name:
+            return
+        
+        path = os.path.join(self.ssh_dir, profile_name + ".json")
+        if not os.path.exists(path):
+            return
+        
+        try:
+            with open(path, 'r') as f:
+                profile = json.load(f)
+            
+            # Load connection settings
+            self.ssh_host_entry.delete(0, tk.END)
+            self.ssh_host_entry.insert(0, profile.get("host", ""))
+            
+            self.ssh_port_entry.delete(0, tk.END)
+            self.ssh_port_entry.insert(0, profile.get("port", "22"))
+            
+            self.ssh_user_entry.delete(0, tk.END)
+            self.ssh_user_entry.insert(0, profile.get("user", ""))
+            
+            auth_type = profile.get("auth_type", "password")
+            self.ssh_auth_var.set(auth_type)
+            self.toggle_ssh_auth_fields()
+            
+            self.ssh_pass_entry.delete(0, tk.END)
+            self.ssh_pass_entry.insert(0, profile.get("password", ""))
+            
+            self.ssh_key_entry.delete(0, tk.END)
+            self.ssh_key_entry.insert(0, profile.get("key_file", ""))
+            
+            # Load port forwarding rules
+            for item in self.ssh_forward_tree.get_children():
+                self.ssh_forward_tree.delete(item)
+            
+            for rule in profile.get("port_forwards", []):
+                self.ssh_forward_tree.insert("", tk.END, values=rule[:3])
+            
+            self.log_message(f"SSH profile loaded: {profile_name}", "INFO")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load profile: {str(e)}")
+            self.log_message(f"Error loading SSH profile: {str(e)}", "ERROR")
+
+    def save_ssh_profile(self):
+        """Save current SSH profile"""
+        profile_name = self.ssh_profile_combo.get()
+        if not profile_name:
+            messagebox.showwarning("Save", "Select or create a profile first")
+            return
+        
+        path = os.path.join(self.ssh_dir, profile_name + ".json")
+        
+        # Collect port forwarding rules
+        port_forwards = []
+        for item in self.ssh_forward_tree.get_children():
+            values = self.ssh_forward_tree.item(item)["values"]
+            port_forwards.append(values)
+        
+        profile = {
+            "host": self.ssh_host_entry.get(),
+            "port": self.ssh_port_entry.get(),
+            "user": self.ssh_user_entry.get(),
+            "auth_type": self.ssh_auth_var.get(),
+            "password": self.ssh_pass_entry.get(),
+            "key_file": self.ssh_key_entry.get(),
+            "port_forwards": port_forwards
+        }
+        
+        try:
+            with open(path, 'w') as f:
+                json.dump(profile, f, indent=2)
+            messagebox.showinfo("Success", f"SSH profile saved: {profile_name}")
+            self.log_message(f"SSH profile saved: {profile_name}", "INFO")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save profile: {str(e)}")
+            self.log_message(f"Error saving SSH profile: {str(e)}", "ERROR")
+
+    def delete_ssh_profile(self):
+        """Delete SSH profile"""
+        profile_name = self.ssh_profile_combo.get()
+        if not profile_name:
+            messagebox.showwarning("Delete", "Select a profile to delete")
+            return
+        
+        if messagebox.askyesno("Confirm", f"Delete SSH profile '{profile_name}'?"):
+            path = os.path.join(self.ssh_dir, profile_name + ".json")
+            try:
+                os.remove(path)
+                self.refresh_ssh_profiles()
+                messagebox.showinfo("Success", "SSH profile deleted")
+                self.log_message(f"SSH profile deleted: {profile_name}", "INFO")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to delete profile: {str(e)}")
+
+    def start_ssh_tunnel(self):
+        """Start SSH tunnel with current configuration"""
+        if self.ssh_tunnel_active:
+            messagebox.showwarning("Status", "SSH tunnel already active")
+            return
+        
+        host = self.ssh_host_entry.get()
+        port = self.ssh_port_entry.get()
+        user = self.ssh_user_entry.get()
+        
+        if not all([host, port, user]):
+            messagebox.showerror("Validation", "Please fill in SSH host, port, and user")
+            return
+        
+        # Build SSH command
+        ssh_cmd = ["ssh"]
+        
+        # Port flag
+        ssh_cmd.extend(["-p", str(port)])
+        
+        # No TTY (for tunneling only)
+        ssh_cmd.append("-N")
+        
+        # Keep-alive options
+        ssh_cmd.extend(["-o", "ServerAliveInterval=60", "-o", "ServerAliveCountMax=3"])
+        
+        # Add port forwarding rules
+        for item in self.ssh_forward_tree.get_children():
+            values = self.ssh_forward_tree.item(item)["values"]
+            forwarding_rule = f"{values[0]}:{values[1]}:{values[2]}"
+            ssh_cmd.extend(["-L", forwarding_rule])
+        
+        # Add authentication
+        if self.ssh_auth_var.get() == "key":
+            key_file = self.ssh_key_entry.get()
+            if not key_file or not os.path.exists(key_file):
+                messagebox.showerror("Error", "Key file not found or invalid")
+                return
+            ssh_cmd.extend(["-i", key_file])
+        
+        # Add host
+        ssh_cmd.append(f"{user}@{host}")
+        
+        try:
+            # Start SSH process
+            self.ssh_tunnel_process = subprocess.Popen(
+                ssh_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True
+            )
+            
+            # If using password, send it
+            if self.ssh_auth_var.get() == "password":
+                password = self.ssh_pass_entry.get()
+                if password:
+                    try:
+                        self.ssh_tunnel_process.stdin.write(password + "\n")
+                        self.ssh_tunnel_process.stdin.flush()
+                        self.ssh_tunnel_process.stdin.close()
+                    except:
+                        pass
+            
+            self.ssh_tunnel_active = True
+            self.active_ssh_tunnel = self.ssh_profile_combo.get()
+            
+            # Update UI
+            self.update_ssh_status(True)
+            if hasattr(self, 'ssh_connect_btn'):
+                self.ssh_connect_btn.config(state="disabled")
+            if hasattr(self, 'ssh_disconnect_btn'):
+                self.ssh_disconnect_btn.config(state="normal")
+            if hasattr(self, 'ssh_terminal_btn'):
+                self.ssh_terminal_btn.config(state="normal")
+            
+            messagebox.showinfo("Success", "SSH tunnel started")
+            self.log_message(f"SSH tunnel started: {self.active_ssh_tunnel}", "INFO")
+            
+            # Monitor tunnel in background
+            threading.Thread(target=self.monitor_ssh_tunnel, daemon=True).start()
+        
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to start SSH tunnel: {str(e)}")
+            self.log_message(f"Error starting SSH tunnel: {str(e)}", "ERROR")
+            self.ssh_tunnel_active = False
+
+    def stop_ssh_tunnel(self):
+        """Stop SSH tunnel"""
+        if not self.ssh_tunnel_active:
+            messagebox.showwarning("Status", "SSH tunnel not active")
+            return
+        
+        try:
+            if self.ssh_tunnel_process:
+                self.ssh_tunnel_process.terminate()
+                try:
+                    self.ssh_tunnel_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.ssh_tunnel_process.kill()
+            
+            self.ssh_tunnel_active = False
+            self.active_ssh_tunnel = None
+            
+            # Update UI
+            self.update_ssh_status(False)
+            self.ssh_connect_btn.config(state="normal")
+            self.ssh_disconnect_btn.config(state="disabled")
+            self.ssh_terminal_btn.config(state="disabled")
+            
+            messagebox.showinfo("Success", "SSH tunnel stopped")
+            self.log_message("SSH tunnel stopped", "INFO")
+        
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to stop SSH tunnel: {str(e)}")
+            self.log_message(f"Error stopping SSH tunnel: {str(e)}", "ERROR")
+
+    def update_ssh_status(self, connected):
+        """Update SSH tunnel status display"""
+        if connected:
+            self.ssh_status_canvas.itemconfig(self.ssh_status_circle, fill="#4caf50")
+            self.ssh_status_label.config(text=f"Status: Connected ({self.active_ssh_tunnel})")
+        else:
+            self.ssh_status_canvas.itemconfig(self.ssh_status_circle, fill="#bdbdbd")
+            self.ssh_status_label.config(text="Status: Disconnected")
+
+    def monitor_ssh_tunnel(self):
+        """Monitor SSH tunnel process"""
+        debug_log = os.path.join(self.base_dir, "ssh_tunnel_debug.log")
+        while self.ssh_tunnel_active:
+            if self.ssh_tunnel_process and self.ssh_tunnel_process.poll() is not None:
+                # Process ended unexpectedly - capture stderr
+                stderr_output = ""
+                try:
+                    stderr_output = self.ssh_tunnel_process.stderr.read() if self.ssh_tunnel_process.stderr else ""
+                except:
+                    pass
+                
+                # Log SSH error
+                with open(debug_log, 'a') as f:
+                    f.write(f"[{datetime.datetime.now()}] SSH tunnel closed. Exit code: {self.ssh_tunnel_process.returncode}\n")
+                    if stderr_output:
+                        f.write(f"SSH Error: {stderr_output}\n")
+                
+                self.ssh_tunnel_active = False
+                self.root.after(0, self.on_ssh_tunnel_closed)
+                break
+            time.sleep(1)
+
+    def on_ssh_tunnel_closed(self):
+        """Called when SSH tunnel process closes unexpectedly"""
+        self.update_ssh_status(False)
+        if hasattr(self, 'ssh_connect_btn'):
+            self.ssh_connect_btn.config(state="normal")
+        if hasattr(self, 'ssh_disconnect_btn'):
+            self.ssh_disconnect_btn.config(state="disabled")
+        if hasattr(self, 'ssh_terminal_btn'):
+            self.ssh_terminal_btn.config(state="disabled")
+        
+        # Read debug log for error info
+        debug_log = os.path.join(self.base_dir, "ssh_tunnel_debug.log")
+        error_msg = "SSH tunnel closed unexpectedly"
+        try:
+            if os.path.exists(debug_log):
+                with open(debug_log, 'r') as f:
+                    content = f.read().strip()
+                    lines = [line.strip() for line in content.split('\n') if line.strip()]
+                    if lines:
+                        # Find SSH Error line
+                        for line in lines[-3:]:  # Check last 3 lines
+                            if "SSH Error:" in line or "connect to host" in line or "Exit code" in line:
+                                error_msg = line
+                                break
+        except Exception as e:
+            error_msg = f"SSH connection failed: {str(e)}"
+        
+        self.log_message(error_msg, "WARN")
+        messagebox.showwarning("SSH Tunnel", error_msg)
+
+    def open_ssh_terminal(self):
+        """Open SSH terminal window (Putty-like)"""
+        if not self.ssh_tunnel_active:
+            messagebox.showwarning("Status", "SSH tunnel not active. Please connect first.")
+            return
+        
+        host = self.ssh_host_entry.get()
+        port = self.ssh_port_entry.get()
+        user = self.ssh_user_entry.get()
+        
+        if not all([host, port, user]):
+            messagebox.showerror("Validation", "SSH connection details are incomplete")
+            return
+        
+        try:
+            # Build SSH command string
+            ssh_cmd_str = f"ssh -p {port}"
+            
+            # Add authentication
+            if self.ssh_auth_var.get() == "key":
+                key_file = self.ssh_key_entry.get()
+                if key_file and os.path.exists(key_file):
+                    ssh_cmd_str += f" -i {key_file}"
+            
+            # Add host
+            ssh_cmd_str += f" {user}@{host}"
+            
+            # Open in terminal based on OS
+            if SYSTEM_OS == "Linux":
+                # Try different terminal emulators
+                terminals = {
+                    "gnome-terminal": ["{term}", "--", "bash", "-c", "{cmd}"],
+                    "xfce4-terminal": ["{term}", "-e", "{cmd}"],
+                    "konsole": ["{term}", "-e", "{cmd}"],
+                    "xterm": ["{term}", "-e", "{cmd}"],
+                }
+                
+                terminal_found = False
+                for term_name, term_args in terminals.items():
+                    if shutil.which(term_name):
+                        # Replace placeholders
+                        cmd_args = [arg.format(term=term_name, cmd=ssh_cmd_str) for arg in term_args]
+                        subprocess.Popen(cmd_args)
+                        self.log_message(f"SSH terminal opened: {user}@{host}:{port}", "INFO")
+                        terminal_found = True
+                        break
+                
+                if not terminal_found:
+                    messagebox.showwarning("Warning", "No terminal emulator found. Tried: " + ", ".join(terminals.keys()))
+            
+            elif IS_MAC:
+                # macOS - use Terminal.app via AppleScript
+                # Escape quotes in SSH command for AppleScript
+                escaped_ssh = ssh_cmd_str.replace('"', '\\"')
+                script = f'tell application "Terminal" to do script "{escaped_ssh}"'
+                subprocess.Popen(["osascript", "-e", script])
+                self.log_message(f"SSH terminal opened: {user}@{host}:{port}", "INFO")
+            
+            else:
+                # Windows - use PuTTY or cmd
+                if shutil.which("putty"):
+                    putty_cmd = ["putty", f"-P {port}", f"{user}@{host}"]
+                    subprocess.Popen(putty_cmd)
+                else:
+                    subprocess.Popen(["cmd", "/c", "start", "cmd", "/k", ssh_cmd_str])
+                self.log_message(f"SSH terminal opened: {user}@{host}:{port}", "INFO")
+        
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open SSH terminal: {str(e)}")
+            self.log_message(f"Error opening SSH terminal: {str(e)}", "ERROR")
+
     def on_ok(self, e, win, res):
         res[0] = e.get()
         win.destroy()
@@ -1146,6 +2130,7 @@ def simple_input(parent, title, prompt):
     return res[0]
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     root = tk.Tk()
     app = LivConnectApp(root)
     root.mainloop()

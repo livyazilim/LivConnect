@@ -1,3 +1,4 @@
-tk
+tkinter
 pystray
 Pillow
+python-xlib
