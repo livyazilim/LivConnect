@@ -2,6 +2,8 @@
 
 **LivConnect** is a comprehensive, lightweight GUI wrapper for managing enterprise VPN connections and local network configurations. Conceptualized by **Liv Yazılım ve Danışmanlık**, this tool streamlines complex network tasks into a user-friendly interface.
 
+<img width="1248" height="920" alt="livconnect_network_tab" src="https://github.com/user-attachments/assets/ea491612-02fa-4b88-a3c1-654ce3bfc835" />
+
 > 🤖 **AI-Augmented Design:** This software was architected and refined with the assistance of Artificial Intelligence, demonstrating the synergy between human expertise and modern AI capabilities.
 
 ![Python](https://img.shields.io/badge/Python-3.x-blue.svg)
