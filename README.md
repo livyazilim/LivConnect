@@ -1,6 +1,6 @@
 # LivConnect - Enterprise Network & VPN Suite
 
-**LivConnect** is a comprehensive, lightweight GUI wrapper for managing enterprise VPN connections and local network configurations. Conceptualized by **Liv Yazılım ve Danışmanlık**, this tool streamlines complex network tasks into a user-friendly interface.
+**LivConnect** is a comprehensive, lightweight GUI wrapper for managing enterprise VPN connections, local network configurations, and remote server access. Conceptualized by **Liv Yazılım ve Danışmanlık**, this tool streamlines complex network tasks into a user-friendly interface.
 
 <img width="1248" height="920" alt="livconnect_network_tab" src="https://github.com/user-attachments/assets/ea491612-02fa-4b88-a3c1-654ce3bfc835" />
 
@@ -24,6 +24,11 @@
 * **Static Routes:** Easily add or remove persistent static routes for specific subnets.
 * **One-Click Apply:** Apply complex network settings (IP, Gateway, DNS, Routes) instantly via `nmcli`.
 
+### 🔌 SSH & Remote Access (New!)
+* **SSH Tunneling:** Create secure **Local Port Forwarding** tunnels with a simple UI. Ideal for accessing internal databases or web services through a bastion host without complex CLI flags.
+* **Integrated Terminal Manager:** A **PuTTY-style** interface to manage and launch SSH connections.
+* **Session Management:** Save host credentials, ports, and private key paths for quick, repeated access to your servers.
+
 ### 💻 User Experience
 * **System Tray Integration:** Runs in the background and minimizes to the system tray for quick access.
 * **Modern GUI:** Clean Tkinter-based interface designed for enterprise ease of use.
@@ -44,6 +49,7 @@ This application is a GUI wrapper. The underlying tools must be installed on you
 ### macOS (via Homebrew)
 ~~~bash
 brew install openfortivpn strongswan
+# Python libraries for SSH (usually installed via requirements.txt)
 ~~~
 
 ### Linux (Debian/Ubuntu/Mint)
@@ -57,7 +63,7 @@ sudo apt install openfortivpn strongswan libstrongswan-standard-plugins strongsw
 
 1. **Clone the repository:**
    ~~~bash
-   git clone [https://github.com/livyazilim/LivConnect.git](https://github.com/livyazilim/LivConnect.git)
+   git clone https://github.com/livyazilim/LivConnect.git
    cd LivConnect
    ~~~
 
@@ -81,8 +87,11 @@ sudo apt install openfortivpn strongswan libstrongswan-standard-plugins strongsw
 ### Network Module (IP Changer)
 1. **Select Module:** Switch to "Network Manager" from the sidebar.
 2. **Configure:** Choose "Manual" to set a Static IP or "Automatic" for DHCP.
-3. **Add Routes:** (Optional) Add specific static routes for your corporate intranet.
-4. **Save & Apply:** Save as a JSON profile for later use, or click **⚡ APPLY CONFIGURATION** to update your network interface immediately.
+3. **Save & Apply:** Save as a JSON profile or click **⚡ APPLY CONFIGURATION** to update your network interface immediately.
+
+### SSH & Terminal Module
+1. **Tunneling:** Navigate to the SSH tab. Enter your Local Port, Destination Host/Port, and SSH Server details. Click **Start Tunnel**.
+2. **Remote Terminal:** Select a saved server profile and click **Connect** to launch a terminal session directly (simulating a PuTTY experience).
 
 ## ⚠️ License
 
