@@ -2,21 +2,27 @@
 
 **LivConnect** is a comprehensive, lightweight GUI wrapper for managing enterprise VPN connections, local network configurations, and remote server access. Conceptualized by **Liv Yazılım ve Danışmanlık**, this tool streamlines complex network tasks into a user-friendly interface.
 
-
-<img width="1250" height="918" alt="image" src="https://github.com/user-attachments/assets/5df405b4-c9b5-4126-89ad-ac1ff3c93fbc" />
-
+<img width="1250" height="918" alt="LivConnect Dashboard" src="https://github.com/user-attachments/assets/5df405b4-c9b5-4126-89ad-ac1ff3c93fbc" />
 
 > 🤖 **AI-Augmented Design:** This software was architected and refined with the assistance of Artificial Intelligence, demonstrating the synergy between human expertise and modern AI capabilities.
 
+![Version](https://img.shields.io/badge/Version-2.1-brightgreen.svg)
 ![Python](https://img.shields.io/badge/Python-3.x-blue.svg)
 ![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-lightgrey.svg)
 ![License](https://img.shields.io/badge/License-GPLv3-green.svg)
 ![Developer](https://img.shields.io/badge/Developer-Liv%20Yazılım-orange.svg)
 
-## 🚀 Features
+## 🚀 What's New in v2.1
+
+* **📲 Fortinet OTP/SMS Support:** Full support for Two-Factor Authentication (2FA) has been added. If your Fortinet SSL VPN connection requires an OTP (SMS or Token), LivConnect will now automatically prompt you to enter the code via a secure popup dialog.
+
+---
+
+## ✨ Features
 
 ### 🔐 VPN Management
 * **Dual Protocol Support:** Manage **FortiSSL (OpenFortiVPN)** and **IPsec (StrongSwan)** connections in one place.
+* **OTP & 2FA Ready (New!):** Seamless handling of SMS-based authentication for Fortinet connections.
 * **Auto-Cert Detection:** Automatically detects and helps trust self-signed Fortinet certificates.
 * **Secure Privilege Handling:** Uses `pkexec` (Linux) or `osascript` (macOS) to request root privileges only when establishing a connection.
 
@@ -26,7 +32,7 @@
 * **Static Routes:** Easily add or remove persistent static routes for specific subnets.
 * **One-Click Apply:** Apply complex network settings (IP, Gateway, DNS, Routes) instantly via `nmcli`.
 
-### 🔌 SSH & Remote Access (New!)
+### 🔌 SSH & Remote Access
 * **SSH Tunneling:** Create secure **Local Port Forwarding** tunnels with a simple UI. Ideal for accessing internal databases or web services through a bastion host without complex CLI flags.
 * **Integrated Terminal Manager:** A **PuTTY-style** interface to manage and launch SSH connections.
 * **Session Management:** Save host credentials, ports, and private key paths for quick, repeated access to your servers.
@@ -84,7 +90,8 @@ sudo apt install openfortivpn strongswan libstrongswan-standard-plugins strongsw
 ### VPN Module
 1. **Create Profile:** Click "Create Profile", select the protocol (Forti/IPsec), and enter your credentials.
 2. **Connect:** Select a profile from the sidebar and click **CONNECT**.
-3. **Tray:** Close the window to minimize to the tray. Right-click the icon to disconnect.
+3. **OTP Verification (v2.1):** If the server requests an SMS code, a dialog box will appear. Enter your code and press OK to finalize the tunnel.
+4. **Tray:** Close the window to minimize to the tray. Right-click the icon to disconnect.
 
 ### Network Module (IP Changer)
 1. **Select Module:** Switch to "Network Manager" from the sidebar.
