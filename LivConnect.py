@@ -13,6 +13,9 @@ import threading
 import json
 import time
 import sys
+import socket
+import select
+import shlex
 
 if not getattr(sys, 'frozen', False):
     try:
@@ -109,7 +112,8 @@ class LivConnectApp:
         self.current_process = None
         self.active_ipsec_conn = None
         self.is_connecting = False
-        self.connected_profile_name = None 
+        self.connected_profile_name = None
+        self.livconnect_auth_type = 'normal'  # Track if profile requires OTP/2FA (livconnect_auth_type=otp) 
         
         # SSH Tunnel State Variables
         self.ssh_tunnel_process = None
@@ -130,14 +134,12 @@ class LivConnectApp:
         self.create_menu_bar()
         self.setup_ui_components()
 
-        self.log_message(f"LivConnect v2.0 initialized on {SYSTEM_OS}.")
+        self.log_message(f"LivConnect v2.1 initialized on {SYSTEM_OS}.")
         
         # Tray Thread
         self.tray_update_thread_stop = False
         if HAS_TRAY:
             threading.Thread(target=self.init_tray_icon, daemon=True).start()
-            # Tray menüsünü periyodik olarak güncellemek için thread başlat
-            threading.Thread(target=self._tray_menu_update_loop, daemon=True).start()
 
         # Background Monitor
         self.monitor_vpn_status()
@@ -345,7 +347,7 @@ class LivConnectApp:
         self.ent_iface_ip.grid(row=0, column=1, padx=5)
         self.ent_iface_ip.insert(0, "192.168.1.150")
 
-        # Subnet Mask (NEW)
+        # Subnet Mask
         tk.Label(grid_frame, text="Subnet Mask:", bg="white").grid(row=0, column=2, padx=5, sticky="e")
         self.ent_iface_subnet = tk.Entry(grid_frame, width=15)
         self.ent_iface_subnet.grid(row=0, column=3, padx=5)
@@ -383,7 +385,7 @@ class LivConnectApp:
         # Add Route Button
         tk.Button(r_frame, text="Add Route", bg="#bbdefb", command=self.add_route_to_list).pack(side=tk.LEFT, padx=(10, 5))
         
-        # Remove Selected Button (Moved here per request)
+        # Remove Selected Button
         tk.Button(r_frame, text="Remove Selected", command=self.remove_net_row, bg="#ffcdd2").pack(side=tk.LEFT, padx=5)
 
         # Treeview
@@ -415,7 +417,7 @@ class LivConnectApp:
     def toggle_ip_inputs(self):
         state = "normal" if self.ip_mode_var.get() == "manual" else "disabled"
         self.ent_iface_ip.config(state=state)
-        self.ent_iface_subnet.config(state=state) # Updated
+        self.ent_iface_subnet.config(state=state)
         self.ent_iface_gw.config(state=state)
         self.ent_iface_dns.config(state=state)
 
@@ -439,7 +441,7 @@ class LivConnectApp:
             # Default structure
             default_data = {
                 "mode": "auto",
-                "ip": "", "subnet": "255.255.255.0", "gateway": "", "dns": "", # Updated default
+                "ip": "", "subnet": "255.255.255.0", "gateway": "", "dns": "",
                 "routes": []
             }
             with open(path, 'w') as f: json.dump(default_data, f)
@@ -469,7 +471,7 @@ class LivConnectApp:
         data = {
             "mode": self.ip_mode_var.get(),
             "ip": self.ent_iface_ip.get(),
-            "subnet": self.ent_iface_subnet.get(), # Updated
+            "subnet": self.ent_iface_subnet.get(),
             "gateway": self.ent_iface_gw.get(),
             "dns": self.ent_iface_dns.get(),
             "routes": routes
@@ -495,8 +497,8 @@ class LivConnectApp:
                 self.ent_iface_ip.delete(0, tk.END)
                 self.ent_iface_ip.insert(0, data.get("ip", ""))
                 
-                self.ent_iface_subnet.delete(0, tk.END) # Updated
-                self.ent_iface_subnet.insert(0, data.get("subnet", "")) # Updated
+                self.ent_iface_subnet.delete(0, tk.END)
+                self.ent_iface_subnet.insert(0, data.get("subnet", ""))
                 
                 self.ent_iface_gw.delete(0, tk.END)
                 self.ent_iface_gw.insert(0, data.get("gateway", ""))
@@ -525,17 +527,279 @@ class LivConnectApp:
         for item in self.net_tree.get_children(): self.net_tree.delete(item)
 
     def get_active_connection_name(self):
-        """Returns the active NetworkManager connection name."""
+        """Returns the active NetworkManager connection name (Linux only)."""
+        # NetworkManager is Linux-only
+        if SYSTEM_OS != 'Linux':
+            return None
+        
         try:
             # nmcli -t -f NAME,DEVICE connection show --active
             # Returns: Wired connection 1:eth0
-            res = subprocess.check_output(["nmcli", "-t", "-f", "NAME", "connection", "show", "--active"], text=True)
+            res = subprocess.check_output(["nmcli", "-t", "-f", "NAME", "connection", "show", "--active"], text=True, timeout=5)
             if res:
                 return res.split('\n')[0].strip() # Return first active connection
-        except: return None
+        except Exception as e:
+            self.log_message(f"Could not get NetworkManager connection: {e}", "WARN")
+            return None
         return None
 
+    def get_internal_ip(self):
+        """Get the internal (local) IP address of the machine directly."""
+        return self.get_internal_ip_direct()
+
+    def get_internal_ip_direct(self):
+        """Get the internal (local) IP address of the machine directly."""
+        try:
+            # Get the primary network interface's IP
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # Connect to a public DNS server (doesn't actually send data)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip if ip else "N/A"
+        except Exception as e:
+            return "N/A"
+
+    def get_external_ip(self):
+        """Get the external (public) IP address directly."""
+        return self.get_external_ip_direct()
+
+    def get_external_ip_direct(self):
+        """Get the external (public) IP address by querying an external service."""
+        try:
+            # Try multiple services in case one is down
+            services = [
+                "https://api.ipify.org?format=json",
+                "https://icanhazip.com",
+                "https://ident.me"
+            ]
+            
+            for service in services:
+                try:
+                    import urllib.request
+                    with urllib.request.urlopen(service, timeout=5) as response:
+                        data = response.read().decode('utf-8').strip()
+                        # If it's JSON, extract the IP
+                        if '{' in data:
+                            import json
+                            data = json.loads(data).get('ip', data)
+                        # Validate it looks like an IP
+                        if '.' in data and len(data) < 16:
+                            return data
+                except Exception as e:
+                    continue
+            
+            return "N/A"
+        except Exception as e:
+            return "N/A"
+
+    def _write_protocol_log(self, protocol, message):
+        """Write protocol-specific logs (openforti, ipsec, ssh)"""
+        try:
+            log_file = os.path.join(self.base_dir, f"{protocol}.log")
+            with open(log_file, 'a') as f:
+                f.write(message + "\n")
+        except Exception as e:
+            print(f"Error writing {protocol} log: {str(e)}")
+
+    def _monitor_forti_otp(self):
+        """Monitor openfortivpn stdout for OTP/SMS prompts and handle them"""
+        try:
+            if not self.current_process or not self.current_process.stdout:
+                return
+            
+            import select
+            import fcntl
+            
+            # Store process reference to detect if it gets killed mid-execution
+            process_ref = self.current_process
+            
+            # Set stdout to non-blocking mode
+            try:
+                flags = fcntl.fcntl(process_ref.stdout, fcntl.F_GETFL)
+                fcntl.fcntl(process_ref.stdout, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+            except:
+                pass
+            
+            timeout_counter = 0
+            max_timeout = 300  # 5 minutes max wait for SMS
+            otp_prompt_triggered = False
+            buffer = ""
+            authenticated_without_otp = False  # Track if we got "Authenticated" without OTP
+            gateway_connected_time = None  # Track when gateway connected
+            last_output_time = time.time()  # Track last output from process
+            
+            while process_ref and process_ref.poll() is None and timeout_counter < max_timeout:
+                # Safety check: if current_process was changed/cleared, exit
+                if self.current_process != process_ref:
+                    self.log_message("OTP monitor: Process reference changed, exiting", "WARN")
+                    return
+                
+                # If we detected "Authenticated" → connection complete, no OTP needed
+                if authenticated_without_otp:
+                    self.log_message("VPN authenticated without OTP prompt. Connection successful.", "INFO")
+                    break
+                
+                try:
+                    # Check if data is available on stdout with 2-second select timeout
+                    if select.select([process_ref.stdout], [], [], 2)[0]:
+                        try:
+                            chunk = process_ref.stdout.read(1024)
+                            if chunk:
+                                buffer += chunk
+                                # Process complete lines
+                                while '\n' in buffer:
+                                    line, buffer = buffer.split('\n', 1)
+                                    line = line.strip()
+                                    if line:
+                                        last_output_time = time.time()  # Update last output time
+                                        self.log_message(f"[FortiVPN] {line}", "INFO")
+                                        self._write_protocol_log("openforti", f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {line}")
+                                        
+                                        # Check for common OTP/SMS prompts
+                                        lower_line = line.lower()
+                                        # Trigger on 2FA/OTP keywords, but NOT on generic "authentication" or "Authenticated"
+                                        is_otp_prompt = any(prompt in lower_line for prompt in ["two-factor", "sms", "otp", "token:", "challenge:"])
+                                        is_not_auth_complete = "authenticated." not in lower_line  # Skip "Authenticated." completion message
+                                        
+                                        if not otp_prompt_triggered and is_otp_prompt and is_not_auth_complete:
+                                            self.log_message(f"OTP/SMS Prompt detected: {line}", "WARN")
+                                            self._write_protocol_log("openforti", f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] OTP/SMS Prompt detected! Showing dialog...")
+                                            
+                                            # Ask user for OTP/SMS code
+                                            self.root.after(0, self._prompt_for_otp, line)
+                                            otp_prompt_triggered = True
+                                            # Don't return - continue monitoring for connection success
+                                        
+                                        # Check if connection was successful
+                                        if "authenticated" in lower_line:
+                                            # "Authenticated" message received
+                                            if self.livconnect_auth_type == 'otp':
+                                                # OTP-enabled profile: wait 3 seconds, then show OTP dialog
+                                                self.log_message(f"Authenticated detected. OTP profile - waiting 3s for SMS...", "INFO")
+                                                time.sleep(3)
+                                                if not otp_prompt_triggered:
+                                                    self.log_message(f"Showing OTP dialog (3s after Authenticated)", "WARN")
+                                                    self._write_protocol_log("openforti", f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] OTP profile: showing SMS dialog after Authenticated")
+                                                    self.root.after(0, self._prompt_for_otp, "SMS/OTP Code Required")
+                                                    otp_prompt_triggered = True
+                                            else:
+                                                # Normal profile: no OTP needed
+                                                authenticated_without_otp = True
+                                                otp_prompt_triggered = True  # Prevent dialog from opening
+                                                gateway_connected_time = time.time()  # Record when gateway connected
+                                                self.log_message(f"VPN Connection Established (No OTP required)", "INFO")
+                                                self.root.after(0, lambda: (
+                                                    self.toggle_buttons(True),
+                                                    self.set_status(f"Connected: {self.connected_profile_name}", "connected"),
+                                                    self.root.update()
+                                                ))
+                                        elif "connected to gateway" in lower_line or "add route" in lower_line:
+                                            # Gateway connected - check if OTP needed
+                                            if self.livconnect_auth_type == 'otp' and not otp_prompt_triggered:
+                                                # OTP profile: show dialog after gateway connect
+                                                self.log_message(f"Gateway connected. OTP profile detected - showing SMS dialog...", "WARN")
+                                                self._write_protocol_log("openforti", f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] OTP profile: showing SMS dialog after gateway connect")
+                                                self.root.after(0, self._prompt_for_otp, "SMS/OTP Code Required")
+                                                otp_prompt_triggered = True
+                                            else:
+                                                # Normal profile: connection is complete
+                                                if not authenticated_without_otp and not otp_prompt_triggered:
+                                                    gateway_connected_time = time.time()  # Record when gateway connected
+                                                    last_output_time = time.time()  # Reset output timer
+                                                self.log_message(f"VPN Connection Established", "INFO")
+                                                self.root.after(0, lambda: (
+                                                    self.toggle_buttons(True),
+                                                    self.set_status(f"Connected: {self.connected_profile_name}", "connected"),
+                                                    self.root.update()
+                                                ))
+                        except (IOError, OSError):
+                            # Non-blocking read when no data available
+                            pass
+                    else:
+                        timeout_counter += 1
+                        time.sleep(1)
+                except Exception as inner_e:
+                    self.log_message(f"OTP monitor read error: {str(inner_e)}", "ERROR")
+                    break
+                    
+        except Exception as e:
+            self.log_message(f"Error monitoring OTP: {str(e)}", "ERROR")
+            self._write_protocol_log("openforti", f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Monitor error: {str(e)}")
+
+    def _prompt_for_otp(self, prompt_message):
+        """Prompt user for OTP/SMS code via Tkinter dialog"""
+        try:
+            top = tk.Toplevel(self.root)
+            top.title("2FA Authentication Required")
+            top.geometry("450x260")  # Increased size for all components
+            top.configure(bg="white")
+            top.resizable(False, False)
+            top.attributes('-topmost', True)  # Stay on top
+            
+            # Header
+            header = tk.Frame(top, bg=COLOR_WARNING, pady=10)
+            header.pack(fill=tk.X)
+            tk.Label(header, text="🔐 SMS/OTP Authentication", font=("Segoe UI", 12, "bold"), fg="white", bg=COLOR_WARNING).pack()
+            
+            # Message
+            msg_frame = tk.Frame(top, bg="white", pady=15)
+            msg_frame.pack(fill=tk.X, padx=20)
+            tk.Label(msg_frame, text=f"VPN requires OTP authentication:\n{prompt_message}", font=("Segoe UI", 10), bg="white", justify=tk.LEFT).pack(anchor="w")
+            
+            # OTP Input
+            tk.Label(msg_frame, text="Enter OTP/SMS Code:", font=("Segoe UI", 10, "bold"), bg="white").pack(anchor="w", pady=(10, 5))
+            otp_entry = tk.Entry(msg_frame, font=("Segoe UI", 12), width=20, show="*")
+            otp_entry.pack(anchor="w")
+            otp_entry.focus_set()
+            
+            def send_otp():
+                otp_code = otp_entry.get().strip()
+                self.log_message(f"[OTP Dialog] Code entered: {len(otp_code)} chars", "INFO")
+                
+                if not otp_code:
+                    messagebox.showwarning("Warning", "Please enter OTP code")
+                    return
+                
+                try:
+                    self.log_message(f"[OTP Dialog] Checking process: {self.current_process is not None}, stdin: {self.current_process.stdin if self.current_process else None}", "INFO")
+                    
+                    if self.current_process and self.current_process.stdin:
+                        self.log_message(f"[OTP Dialog] Sending code to stdin", "INFO")
+                        self.current_process.stdin.write(otp_code + "\n")
+                        self.current_process.stdin.flush()
+                        self.log_message(f"OTP code sent to VPN. Closing dialog...", "INFO")
+                        self._write_protocol_log("openforti", f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] OTP code submitted by user")
+                        top.destroy()  # Close immediately after sending
+                    else:
+                        self.log_message(f"[OTP Dialog] Process not available!", "ERROR")
+                        messagebox.showerror("Error", "VPN process not available")
+                except Exception as e:
+                    self.log_message(f"Error sending OTP: {str(e)}", "ERROR")
+                    messagebox.showerror("Error", f"Failed to send OTP: {str(e)}")
+            
+            # Buttons
+            btn_frame = tk.Frame(top, bg="white", pady=10)
+            btn_frame.pack(fill=tk.X, padx=20)
+            tk.Button(btn_frame, text="Send OTP", bg=COLOR_SUCCESS, fg="white", font=("Segoe UI", 10, "bold"), bd=0, padx=15, pady=8, command=send_otp, cursor="hand2").pack(side=tk.LEFT, padx=5)
+            tk.Button(btn_frame, text="Cancel", bg="#e0e0e0", fg="#333", font=("Segoe UI", 10), bd=0, padx=15, pady=8, command=top.destroy, cursor="hand2").pack(side=tk.LEFT)
+            
+            # Center dialog on screen
+            top.update_idletasks()
+            x = self.root.winfo_x() + (self.root.winfo_width() // 2) - (top.winfo_width() // 2)
+            y = self.root.winfo_y() + (self.root.winfo_height() // 2) - (top.winfo_height() // 2)
+            top.geometry(f"+{x}+{y}")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to show OTP prompt: {str(e)}")
+            self.log_message(f"Error showing OTP prompt: {str(e)}", "ERROR")
+
     def apply_current_net_config(self):
+        # NetworkManager is Linux-only
+        if SYSTEM_OS != 'Linux':
+            messagebox.showerror("Error", "Network Manager is only available on Linux. On macOS, please use System Settings.")
+            return
+        
         conn_name = self.get_active_connection_name()
         if not conn_name:
             messagebox.showerror("Error", "No active NetworkManager connection found.")
@@ -792,6 +1056,13 @@ class LivConnectApp:
             ssh_subs.append(pystray.MenuItem("Disconnect SSH", lambda: self.root.after(0, self.disconnect_ssh_tunnel_from_tray), enabled=self.ssh_tunnel_active))
             menu_items.append(pystray.MenuItem(ssh_status_label, pystray.Menu(*ssh_subs)))
 
+        # IP Information - Load fresh when menu opens
+        menu_items.append(pystray.Menu.SEPARATOR)
+        internal_ip = self.get_internal_ip_direct()
+        external_ip = self.get_external_ip_direct()
+        menu_items.append(pystray.MenuItem(f"Internal IP: {internal_ip}", lambda: None, enabled=False))
+        menu_items.append(pystray.MenuItem(f"External IP: {external_ip}", lambda: None, enabled=False))
+        
         menu_items.append(pystray.Menu.SEPARATOR)
         menu_items.append(pystray.MenuItem("Quit", self.quit_app))
         return pystray.Menu(*menu_items)
@@ -876,27 +1147,6 @@ class LivConnectApp:
         except Exception as e:
             print(f"Show window tray error: {e}")
 
-    def _tray_menu_update_loop(self):
-        """Tray menüsünü periyodik olarak güncelle"""
-        import time
-        import traceback
-        debug_log = os.path.join(self.base_dir, "tray_debug.log")
-        
-        while not self.tray_update_thread_stop:
-            try:
-                if hasattr(self, 'tray_icon') and self.tray_icon is not None and self.tray_icon.visible:
-                    new_menu = self.build_tray_menu()
-                    # Menüyü doğrudan ata (daha sonra update_menu ile güncelle)
-                    self.tray_icon.menu = new_menu
-                    # update_menu() parametresiz çağır - dinamik menü öğelerini yenile
-                    if hasattr(self.tray_icon, 'update_menu'):
-                        self.tray_icon.update_menu()
-            except Exception as e:
-                with open(debug_log, 'a') as f:
-                    f.write(f"[{datetime.datetime.now()}] Tray update error: {str(e)}\n")
-                    f.write(traceback.format_exc())
-            time.sleep(2)  # Her 2 saniyede güncelle
-
     def _restore_window(self):
         self.root.deiconify()
         self.root.lift()
@@ -970,6 +1220,13 @@ class LivConnectApp:
                 ssh_status = "🔐 SSH Tunnel (Connected)" if self.ssh_tunnel_active else "🔐 SSH Tunnel"
                 tray_menu.add_cascade(label=ssh_status, menu=ssh_submenu)
         
+        # IP Information - Load fresh when menu opens
+        tray_menu.add_separator()
+        internal_ip = self.get_internal_ip_direct()
+        external_ip = self.get_external_ip_direct()
+        tray_menu.add_command(label=f"Internal IP: {internal_ip}", state="disabled")
+        tray_menu.add_command(label=f"External IP: {external_ip}", state="disabled")
+        
         tray_menu.add_separator()
         tray_menu.add_command(label="Quit", command=self.quit_app)
         
@@ -1022,21 +1279,48 @@ class LivConnectApp:
                 return 
             path = os.path.join(current_dir, profile_name + ".vpn")
             try:
+                # Log the connection attempt
+                self._write_protocol_log("openforti", f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Attempting to connect: {profile_name}")
+                
                 if IS_MAC:
                     # macOS: Escape path for AppleScript
-                    escaped_path = path.replace('"', '\\"')
-                    safe_cmd = f'openfortivpn -c "{escaped_path}"'
-                    self.current_process = subprocess.Popen(["osascript", "-e", f'do shell script "{safe_cmd}" with administrator privileges'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    escaped_path = path.replace('"', '\\"').replace("'", "\\'")
+                    safe_cmd = f'openfortivpn -c "{escaped_path}" --set-dns=1 --pppd-use-peerdns=1 --use-resolvconf=1 --otp-prompt="Challenge\\|OTP\\|SMS\\|Enter code" --otp-delay=5'
+                    self.current_process = subprocess.Popen(["osascript", "-e", f'do shell script "{safe_cmd}" with administrator privileges'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
                 else:
-                    self.current_process = subprocess.Popen(["pkexec", "openfortivpn", "-c", path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    self.current_process = subprocess.Popen(["pkexec", "openfortivpn", "-c", path, "--set-dns=1", "--pppd-use-peerdns=1", "--use-resolvconf=1", "--otp-prompt=Challenge|OTP|SMS|Enter code", "--otp-delay=5"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
                 
                 self.active_ipsec_conn = None 
                 self.connected_profile_name = profile_name 
-                self.set_status(f"Connected: {profile_name}", "connected")
-                self.toggle_buttons(True)
+                
+                # Read livconnect_auth_type from profile config (livconnect_auth_type=otp or livconnect_auth_type=normal)
+                try:
+                    self.livconnect_auth_type = 'normal'  # Default
+                    with open(path, 'r') as f:
+                        for line in f:
+                            if line.strip().startswith('livconnect_auth_type'):
+                                self.livconnect_auth_type = line.split('=')[1].strip().lower()
+                                self.log_message(f"Profile livconnect_auth_type: {self.livconnect_auth_type}", "INFO")
+                                break
+                except Exception as e:
+                    self.livconnect_auth_type = 'normal'
+                
+                # Start thread to monitor OTP/SMS prompt
+                threading.Thread(target=self._monitor_forti_otp, daemon=True).start()
+                
+                # Don't set status to "Connected" yet - let the monitoring thread confirm it
+                # based on actual openfortivpn output
+                self.set_status(f"Connecting: {profile_name}...", "working")
+                self.root.update()
+                self._write_protocol_log("openforti", f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Process started, waiting for gateway response...")
+                self.is_connecting = False
             except Exception as e:
+                self._write_protocol_log("openforti", f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Connection error: {str(e)}")
                 self.set_status("Error", "error")
                 self.log_message(str(e), "ERROR")
+                self.toggle_buttons(False)  # Re-enable connect button on error
+                self.root.update()
+                self.is_connecting = False
 
         elif protocol == "ipsec":
             conf_path = os.path.join(current_dir, profile_name + ".conf")
@@ -1045,7 +1329,11 @@ class LivConnectApp:
             if not conn_name: 
                 self.is_connecting = False
                 self.log_message("Connection name not found.", "ERROR")
+                self._write_protocol_log("ipsec", f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Connection name not found: {profile_name}")
                 return
+            
+            # Log the connection attempt
+            self._write_protocol_log("ipsec", f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Attempting to connect: {profile_name} (conn: {conn_name})")
             
             # Toplu ipsec komutlarını tek seferde çalıştır - şifre 1 kez soruluyor
             combined_cmd = ["sh", "-c", f"ipsec update && ipsec up {conn_name}"]
@@ -1058,19 +1346,30 @@ class LivConnectApp:
                 self.set_status(f"Connected: {profile_name}", "connected")
                 self.log_message("Connection Established", "INFO")
                 self.toggle_buttons(True)
+                self.root.update()
+                self._write_protocol_log("ipsec", f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Successfully connected: {profile_name}")
+                self.is_connecting = False
             else:
                 self.set_status("Error", "error")
                 if res:
                     self.log_message(res.stderr + res.stdout, "ERROR")
+                    self._write_protocol_log("ipsec", f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Connection error: {res.stderr + res.stdout}")
+                self.toggle_buttons(False)  # Re-enable connect button on error
+                self.root.update()
+                self.is_connecting = False
         
         self.is_connecting = False
         self.update_tray_menu()
-
     def disconnect_vpn(self):
         """Terminates the VPN connection forcefully and with proper privileges."""
         self.log_message("Sending disconnect command...", "WARN")
         
         try:
+            # Log the disconnection attempt
+            if self.connected_profile_name:
+                current_protocol = "openforti" if not self.active_ipsec_conn else "ipsec"
+                self._write_protocol_log(current_protocol, f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Disconnecting: {self.connected_profile_name}")
+            
             if IS_MAC:
                 # macOS: Use osascript to send a privileged pkill -9 command
                 cmd = '/usr/bin/pkill -9 openfortivpn'
@@ -1078,6 +1377,7 @@ class LivConnectApp:
                 if hasattr(self, 'active_ipsec_conn') and self.active_ipsec_conn:
                     ipsec_cmd = f'ipsec down {self.active_ipsec_conn}'
                     subprocess.run(["osascript", "-e", f'do shell script "{ipsec_cmd}" with administrator privileges'])
+                    self._write_protocol_log("ipsec", f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Disconnected successfully")
                     self.active_ipsec_conn = None
             else:
                 # Linux: Toplu komut - şifre sadece 1 kez soruluyor
@@ -1085,10 +1385,12 @@ class LivConnectApp:
                     # IPsec aktif ise: pkill + ipsec down toplu yapılır
                     combined_cmd = ["sh", "-c", f"pkill -9 openfortivpn; ipsec down {self.active_ipsec_conn}"]
                     self.run_as_root(combined_cmd)
+                    self._write_protocol_log("ipsec", f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Disconnected successfully")
                     self.active_ipsec_conn = None
                 else:
                     # Sadece FortiVPN açık ise
                     subprocess.run(["pkexec", "pkill", "-9", "openfortivpn"])
+                    self._write_protocol_log("openforti", f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Disconnected successfully")
 
             # Clean up the Python process object if it exists
             if hasattr(self, 'current_process') and self.current_process:
@@ -1103,35 +1405,44 @@ class LivConnectApp:
             self.connected_profile_name = None
             self.set_status("Ready", "ready")
             self.toggle_buttons(False)
+            self.root.update()
             self.update_tray_menu()
             self.log_message("VPN process terminated.", "INFO")
             
         except Exception as e:
             self.log_message(f"Disconnection error: {str(e)}", "ERROR")
+            self.toggle_buttons(False)
+            self.root.update()
             
     def monitor_vpn_status(self):
         if self.is_connecting:
             self.root.after(3000, self.monitor_vpn_status)
             return
 
+        # Only show buttons as locked if we actually have a confirmed connection
+        # (i.e., connected_profile_name is set, not just because process is running)
+        if self.connected_profile_name:
+            # We have an active connection
+            self.toggle_buttons(True)
+        else:
+            # No active connection confirmed
+            self.toggle_buttons(False)
+        
+        # Update status display based on actual process state
         is_forti_up = self.check_process_running("openfortivpn")
         is_ipsec_up = self.check_ipsec_established()
 
-        if is_forti_up:
-            self.set_status("FortiVPN Active", "connected")
-            self.toggle_buttons(True)
-        elif is_ipsec_up:
-            self.set_status("IPsec Active", "connected")
-            self.toggle_buttons(True)
+        if is_forti_up and not self.connected_profile_name:
+            # Process running but not our connection - might be stale
+            self.set_status("Stale Process Detected", "warning")
+        elif is_ipsec_up and not self.connected_profile_name:
+            self.set_status("IPsec Process Detected", "warning")
+        elif self.connected_profile_name:
+            self.set_status(f"Connected: {self.connected_profile_name}", "connected")
         else:
-            current_txt = self.status_label.cget("text")
-            if "Active" in current_txt or "Checking" in current_txt:
-                self.set_status("Ready", "ready")
-                self.toggle_buttons(False)
-                if self.connected_profile_name:
-                    self.connected_profile_name = None
-                    self.update_tray_menu()
+            self.set_status("Ready", "ready")
         
+
         self.root.after(3000, self.monitor_vpn_status)
 
     # -------------------------------------------------------------------------
@@ -1178,6 +1489,10 @@ pppd-use-peerdns = 1           # 1 = Use VPN DNS for lookups
 # --- ADVANCED ---
 # half-internet-routes = 0     # 0 or 1
 # realm = realm-name           # If server requires a realm
+
+# --- LIVCONNECT SETTINGS ---
+# livconnect_auth_type = otp   # Set to 'otp' if VPN requires SMS/2FA authentication
+                                 # Dialog will show automatically after gateway connect
 """
                 with open(os.path.join(current_dir, name + ".vpn"), 'w') as f: f.write(forti_template)
             
@@ -1299,7 +1614,8 @@ YOUR_USERNAME : EAP "YOUR_PASSWORD"
         try:
             full_cmd = ["pkexec", "openfortivpn", "-c", path]
             if IS_MAC:
-                safe = f'openfortivpn -c "{path}" 2>&1'
+                escaped_path = path.replace('"', '\\"').replace("'", "\\'")
+                safe = f'openfortivpn -c "{escaped_path}" 2>&1'
                 proc = subprocess.run(["osascript", "-e", f'do shell script "{safe}" with administrator privileges'], capture_output=True, text=True)
                 out = proc.stdout + proc.stderr
             else:
@@ -1372,15 +1688,16 @@ YOUR_USERNAME : EAP "YOUR_PASSWORD"
         messagebox.showinfo("Info", "Done.")
 
     def run_as_root(self, cmd):
-        c = " ".join(cmd)
+        """Run privileged command using pkexec (Linux) or AppleScript (macOS)."""
         try:
             if IS_MAC:
-                # macOS: Escape quotes for AppleScript
-                escaped_cmd = c.replace('"', '\\"')
-                return subprocess.run(["osascript", "-e", f'do shell script "{escaped_cmd}" with administrator privileges'], capture_output=True, text=True)
-            else:
-                return subprocess.run(["pkexec"] + cmd, capture_output=True, text=True)
-        except: 
+                cmd_str = shlex.join(cmd)
+                escaped_cmd = cmd_str.replace('"', '\\"')
+                script = f'do shell script "{escaped_cmd}" with administrator privileges'
+                return subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+            return subprocess.run(["pkexec", *cmd], capture_output=True, text=True)
+        except Exception as exc:
+            self.log_message(f"run_as_root failed: {exc}", "ERROR")
             return None
 
     # --- STANDARD HELPERS ---
@@ -1392,6 +1709,16 @@ YOUR_USERNAME : EAP "YOUR_PASSWORD"
         f.add_command(label="Settings", command=self.open_settings_window)
         f.add_separator()
         f.add_command(label="Exit", command=self.quit_app)
+        
+        # Tools menu
+        t = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Tools", menu=t)
+        t.add_command(label="📋 View Logs Folder", command=self.open_logs_directory)
+        t.add_separator()
+        t.add_command(label="📝 View OpenForti Logs", command=self.open_openforti_log)
+        t.add_command(label="📝 View IPsec Logs", command=self.open_ipsec_log)
+        t.add_command(label="📝 View SSH Tunnel Logs", command=self.open_ssh_debug_log)
+        
         h = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Help", menu=h)
         h.add_command(label="About", command=self.show_about_dialog)
@@ -1400,7 +1727,7 @@ YOUR_USERNAME : EAP "YOUR_PASSWORD"
         about_text = (
             "LivConnect\n"
             "Enterprise VPN Manager\n"
-            "Version 2.0\n\n"
+            "Version 2.1\n\n"
             "Developed by: Liv Yazılım\n\n"
             "This software is proudly developed and distributed by Liv Yazılım "
             "in accordance with the principles of the GNU General Public License (GPL).\n\n"
@@ -1437,6 +1764,78 @@ YOUR_USERNAME : EAP "YOUR_PASSWORD"
         txt_scroll.configure(state='disabled', cursor="arrow")
 
         tk.Button(top, text="Close", bg="#e0e0e0", bd=0, padx=20, pady=5, command=top.destroy).pack(pady=10)
+
+    def open_logs_directory(self):
+        """Default text editor ile logs klasörünü aç"""
+        try:
+            if SYSTEM_OS == "Darwin":  # macOS
+                subprocess.Popen(["open", "-e", self.base_dir])
+            elif SYSTEM_OS == "Windows":
+                subprocess.Popen(["notepad", self.base_dir])
+            else:  # Linux
+                # xdg-open klasörü default file manager'da açar
+                subprocess.Popen(["xdg-open", self.base_dir])
+            self.log_message(f"Opened logs directory: {self.base_dir}", "INFO")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open logs directory: {str(e)}")
+            self.log_message(f"Error opening logs directory: {str(e)}", "ERROR")
+
+    def open_openforti_log(self):
+        """OpenForti log dosyasını default text editor ile aç"""
+        try:
+            log_file = os.path.join(self.base_dir, "openforti.log")
+            if not os.path.exists(log_file):
+                messagebox.showwarning("Warning", f"OpenForti log file not found:\n{log_file}")
+                return
+            
+            if SYSTEM_OS == "Darwin":  # macOS
+                subprocess.Popen(["open", "-a", "TextEdit", log_file])
+            elif SYSTEM_OS == "Windows":
+                subprocess.Popen(["notepad", log_file])
+            else:  # Linux
+                subprocess.Popen(["xdg-open", log_file])
+            self.log_message(f"Opened OpenForti log: {log_file}", "INFO")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open OpenForti log: {str(e)}")
+            self.log_message(f"Error opening OpenForti log: {str(e)}", "ERROR")
+
+    def open_ipsec_log(self):
+        """IPsec log dosyasını default text editor ile aç"""
+        try:
+            log_file = os.path.join(self.base_dir, "ipsec.log")
+            if not os.path.exists(log_file):
+                messagebox.showwarning("Warning", f"IPsec log file not found:\n{log_file}")
+                return
+            
+            if SYSTEM_OS == "Darwin":  # macOS
+                subprocess.Popen(["open", "-a", "TextEdit", log_file])
+            elif SYSTEM_OS == "Windows":
+                subprocess.Popen(["notepad", log_file])
+            else:  # Linux
+                subprocess.Popen(["xdg-open", log_file])
+            self.log_message(f"Opened IPsec log: {log_file}", "INFO")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open IPsec log: {str(e)}")
+            self.log_message(f"Error opening IPsec log: {str(e)}", "ERROR")
+
+    def open_ssh_debug_log(self):
+        """SSH Tunnel log dosyasını default text editor ile aç"""
+        try:
+            log_file = os.path.join(self.base_dir, "ssh.log")
+            if not os.path.exists(log_file):
+                messagebox.showwarning("Warning", f"SSH Tunnel log file not found:\n{log_file}")
+                return
+            
+            if SYSTEM_OS == "Darwin":  # macOS
+                subprocess.Popen(["open", "-a", "TextEdit", log_file])
+            elif SYSTEM_OS == "Windows":
+                subprocess.Popen(["notepad", log_file])
+            else:  # Linux
+                subprocess.Popen(["xdg-open", log_file])
+            self.log_message(f"Opened SSH Tunnel log: {log_file}", "INFO")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open SSH Tunnel log: {str(e)}")
+            self.log_message(f"Error opening SSH Tunnel log: {str(e)}", "ERROR")
 
     def setup_styles(self):
         s = ttk.Style()
@@ -1859,6 +2258,71 @@ YOUR_USERNAME : EAP "YOUR_PASSWORD"
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to delete profile: {str(e)}")
 
+    def get_ssh_binary(self):
+        """Get path to SSH binary, preferring AppImage/macOS bundled version"""
+        # Check if running in macOS app bundle
+        if hasattr(sys, 'frozen'):
+            if getattr(sys, 'frozen') == 'macosx_app':
+                # macOS app bundle - check Contents/MacOS or ../bin
+                app_bin = os.path.join(os.path.dirname(sys.executable), 'ssh')
+                if os.path.exists(app_bin):
+                    return app_bin
+                # Also check one level up (typical macOS bundle structure)
+                bundle_bin = os.path.join(os.path.dirname(sys.executable), '..', '..', 'bin', 'ssh')
+                if os.path.exists(bundle_bin):
+                    return os.path.abspath(bundle_bin)
+            # Check for PyInstaller AppImage bundled SSH in _MEIPASS
+            if hasattr(sys, '_MEIPASS'):
+                bundled_ssh = os.path.join(sys._MEIPASS, 'bin', 'ssh')
+                if os.path.exists(bundled_ssh):
+                    return bundled_ssh
+        
+        # Fall back to system SSH via which command
+        try:
+            result = subprocess.run(['which', 'ssh'], capture_output=True, text=True, timeout=2)
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except:
+            pass
+        
+        return 'ssh'  # Default, will use PATH
+
+    def get_sshpass_binary(self):
+        """Get path to sshpass binary, preferring bundled copies when frozen"""
+        if hasattr(sys, 'frozen'):
+            exec_dir = os.path.dirname(sys.executable)
+            candidates = [
+                os.path.join(exec_dir, 'sshpass'),
+                os.path.join(exec_dir, '..', '..', 'bin', 'sshpass'),
+            ]
+            if hasattr(sys, '_MEIPASS'):
+                candidates.append(os.path.join(sys._MEIPASS, 'sshpass'))
+                candidates.append(os.path.join(sys._MEIPASS, 'bin', 'sshpass'))
+            for path in candidates:
+                if os.path.exists(path):
+                    return os.path.abspath(path)
+        
+        try:
+            result = subprocess.run(['which', 'sshpass'], capture_output=True, text=True, timeout=2)
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except Exception as e:
+            self.log_message(f"Unable to locate sshpass via which: {e}", "WARN")
+        
+        return None
+
+    def check_port_open(self, host, port, timeout=0.5):
+        """Check if a port is open and accessible - very quick timeout for AppImage"""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            result = sock.connect_ex((host, int(port)))
+            sock.close()
+            return result == 0
+        except Exception as e:
+            self.log_message(f"Port check error for {host}:{port}: {e}", "WARN")
+            return True  # Assume port is open on error (don't block SSH attempt)
+
     def start_ssh_tunnel(self):
         """Start SSH tunnel with current configuration"""
         if self.ssh_tunnel_active:
@@ -1873,58 +2337,91 @@ YOUR_USERNAME : EAP "YOUR_PASSWORD"
             messagebox.showerror("Validation", "Please fill in SSH host, port, and user")
             return
         
-        # Build SSH command
-        ssh_cmd = ["ssh"]
+        # Check if port is open before attempting connection
+        self.log_message(f"Checking if {host}:{port} is open...", "INFO")
+        if not self.check_port_open(host, port):
+            messagebox.showerror("Connection Error", 
+                f"SSH port {port} on {host} is not accessible.\n\n"
+                f"Please verify:\n"
+                f"• The host address is correct\n"
+                f"• The port number is correct\n"
+                f"• SSH service is running on the remote host\n"
+                f"• Network connectivity and firewall rules")
+            self.log_message(f"Port {port} on {host} is not open", "ERROR")
+            return
         
-        # Port flag
-        ssh_cmd.extend(["-p", str(port)])
+        self.log_message(f"Port {port} on {host} is open", "INFO")
+        self._continue_ssh_tunnel(host, port, user)
         
-        # No TTY (for tunneling only)
-        ssh_cmd.append("-N")
-        
-        # Keep-alive options
-        ssh_cmd.extend(["-o", "ServerAliveInterval=60", "-o", "ServerAliveCountMax=3"])
-        
-        # Add port forwarding rules
-        for item in self.ssh_forward_tree.get_children():
-            values = self.ssh_forward_tree.item(item)["values"]
-            forwarding_rule = f"{values[0]}:{values[1]}:{values[2]}"
-            ssh_cmd.extend(["-L", forwarding_rule])
-        
-        # Add authentication
-        if self.ssh_auth_var.get() == "key":
-            key_file = self.ssh_key_entry.get()
-            if not key_file or not os.path.exists(key_file):
-                messagebox.showerror("Error", "Key file not found or invalid")
-                return
-            ssh_cmd.extend(["-i", key_file])
-        
-        # Add host
-        ssh_cmd.append(f"{user}@{host}")
+    def _continue_ssh_tunnel(self, host, port, user):
+        """Start SSH tunnel using OpenSSH subprocess"""
         
         try:
+            # Get SSH binary
+            ssh_binary = self.get_ssh_binary()
+            
+            # Build SSH command
+            ssh_cmd = [ssh_binary, "-p", str(port), "-N"]
+            
+            # SSH options
+            ssh_cmd.extend(["-o", "StrictHostKeyChecking=no"])
+            ssh_cmd.extend(["-o", "UserKnownHostsFile=/dev/null"])
+            ssh_cmd.extend(["-o", "ServerAliveInterval=60"])
+            ssh_cmd.extend(["-o", "ServerAliveCountMax=3"])
+            ssh_cmd.extend(["-o", "PasswordAuthentication=yes"])
+            
+            # Add port forwarding rules
+            for item in self.ssh_forward_tree.get_children():
+                values = self.ssh_forward_tree.item(item)["values"]
+                local_port = values[0]
+                remote_host = values[1]
+                remote_port = values[2]
+                ssh_cmd.extend(["-L", f"{local_port}:{remote_host}:{remote_port}"])
+            
+            # Add authentication
+            if self.ssh_auth_var.get() == "key":
+                key_file = self.ssh_key_entry.get()
+                if not key_file or not os.path.exists(key_file):
+                    messagebox.showerror("Error", "Key file not found or invalid")
+                    return
+                ssh_cmd.extend(["-i", key_file])
+                ssh_cmd.extend(["-o", "PubkeyAuthentication=yes"])
+                self.log_message("Using SSH key authentication", "INFO")
+            else:
+                # Password auth
+                password = self.ssh_pass_entry.get()
+                if not password:
+                    messagebox.showerror("Validation", "Password is required")
+                    return
+                self.log_message("Using SSH password authentication", "INFO")
+            
             # Start SSH process
+            if self.ssh_auth_var.get() == "password":
+                password = self.ssh_pass_entry.get()
+                # Use sshpass for password authentication
+                # Try system sshpass first, then relative path for AppImage
+                sshpass_bin = self.get_sshpass_binary()
+                if not sshpass_bin:
+                    messagebox.showerror("Error", "sshpass not found - cannot use password authentication")
+                    return
+                self.log_message(f"Using sshpass from: {sshpass_bin}", "DEBUG")
+                final_cmd = [sshpass_bin, "-p", password] + ssh_cmd + [f"{user}@{host}"]
+            else:
+                # Use key authentication
+                final_cmd = ssh_cmd + [f"{user}@{host}"]
+            
             self.ssh_tunnel_process = subprocess.Popen(
-                ssh_cmd,
-                stdin=subprocess.PIPE,
+                final_cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 universal_newlines=True
             )
             
-            # If using password, send it
-            if self.ssh_auth_var.get() == "password":
-                password = self.ssh_pass_entry.get()
-                if password:
-                    try:
-                        self.ssh_tunnel_process.stdin.write(password + "\n")
-                        self.ssh_tunnel_process.stdin.flush()
-                        self.ssh_tunnel_process.stdin.close()
-                    except:
-                        pass
-            
             self.ssh_tunnel_active = True
             self.active_ssh_tunnel = self.ssh_profile_combo.get()
+            
+            # Write connection log
+            self._write_protocol_log("ssh", f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] SSH tunnel connecting: {self.active_ssh_tunnel}")
             
             # Update UI
             self.update_ssh_status(True)
@@ -1934,17 +2431,26 @@ YOUR_USERNAME : EAP "YOUR_PASSWORD"
                 self.ssh_disconnect_btn.config(state="normal")
             if hasattr(self, 'ssh_terminal_btn'):
                 self.ssh_terminal_btn.config(state="normal")
+            self.root.update()
             
-            messagebox.showinfo("Success", "SSH tunnel started")
             self.log_message(f"SSH tunnel started: {self.active_ssh_tunnel}", "INFO")
+            self._write_protocol_log("ssh", f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] SSH tunnel connected: {self.active_ssh_tunnel}")
             
             # Monitor tunnel in background
             threading.Thread(target=self.monitor_ssh_tunnel, daemon=True).start()
         
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to start SSH tunnel: {str(e)}")
-            self.log_message(f"Error starting SSH tunnel: {str(e)}", "ERROR")
+            error_msg = f"Failed to start SSH tunnel: {str(e)}"
+            messagebox.showerror("Error", error_msg)
+            self.log_message(error_msg, "ERROR")
+            self._write_protocol_log("ssh", f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Error: {str(e)}")
             self.ssh_tunnel_active = False
+            if hasattr(self, 'ssh_connect_btn'):
+                self.ssh_connect_btn.config(state="normal")
+            if hasattr(self, 'ssh_disconnect_btn'):
+                self.ssh_disconnect_btn.config(state="disabled")
+            self.root.update()
+            self.root.update()
 
     def stop_ssh_tunnel(self):
         """Stop SSH tunnel"""
@@ -1953,6 +2459,11 @@ YOUR_USERNAME : EAP "YOUR_PASSWORD"
             return
         
         try:
+            # Log the disconnection
+            if self.active_ssh_tunnel:
+                self._write_protocol_log("ssh", f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Disconnecting: {self.active_ssh_tunnel}")
+            
+            # Stop subprocess if still active
             if self.ssh_tunnel_process:
                 self.ssh_tunnel_process.terminate()
                 try:
@@ -1968,13 +2479,19 @@ YOUR_USERNAME : EAP "YOUR_PASSWORD"
             self.ssh_connect_btn.config(state="normal")
             self.ssh_disconnect_btn.config(state="disabled")
             self.ssh_terminal_btn.config(state="disabled")
+            self.root.update()
             
+            self._write_protocol_log("ssh", f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Disconnected successfully")
             messagebox.showinfo("Success", "SSH tunnel stopped")
             self.log_message("SSH tunnel stopped", "INFO")
         
         except Exception as e:
             messagebox.showerror("Error", f"Failed to stop SSH tunnel: {str(e)}")
             self.log_message(f"Error stopping SSH tunnel: {str(e)}", "ERROR")
+            self._write_protocol_log("ssh", f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Disconnection error: {str(e)}")
+            self.ssh_connect_btn.config(state="normal")
+            self.ssh_disconnect_btn.config(state="disabled")
+            self.root.update()
 
     def update_ssh_status(self, connected):
         """Update SSH tunnel status display"""
@@ -1986,30 +2503,38 @@ YOUR_USERNAME : EAP "YOUR_PASSWORD"
             self.ssh_status_label.config(text="Status: Disconnected")
 
     def monitor_ssh_tunnel(self):
-        """Monitor SSH tunnel process"""
-        debug_log = os.path.join(self.base_dir, "ssh_tunnel_debug.log")
+        """Monitor SSH tunnel process and detect failures"""
         while self.ssh_tunnel_active:
-            if self.ssh_tunnel_process and self.ssh_tunnel_process.poll() is not None:
-                # Process ended unexpectedly - capture stderr
-                stderr_output = ""
-                try:
-                    stderr_output = self.ssh_tunnel_process.stderr.read() if self.ssh_tunnel_process.stderr else ""
-                except:
-                    pass
+            if self.ssh_tunnel_process:
+                poll_result = self.ssh_tunnel_process.poll()
                 
-                # Log SSH error
-                with open(debug_log, 'a') as f:
-                    f.write(f"[{datetime.datetime.now()}] SSH tunnel closed. Exit code: {self.ssh_tunnel_process.returncode}\n")
-                    if stderr_output:
-                        f.write(f"SSH Error: {stderr_output}\n")
-                
-                self.ssh_tunnel_active = False
-                self.root.after(0, self.on_ssh_tunnel_closed)
-                break
-            time.sleep(1)
+                # Check if process ended
+                if poll_result is not None:
+                    # Get stdout/stderr for debugging
+                    stdout = ""
+                    stderr = ""
+                    try:
+                        if self.ssh_tunnel_process.stdout:
+                            stdout = self.ssh_tunnel_process.stdout.read()
+                        if self.ssh_tunnel_process.stderr:
+                            stderr = self.ssh_tunnel_process.stderr.read()
+                    except:
+                        pass
+                    
+                    if stdout:
+                        self.log_message(f"SSH stdout: {stdout}", "DEBUG")
+                    if stderr:
+                        self.log_message(f"SSH stderr: {stderr}", "DEBUG")
+                    
+                    self.log_message(f"SSH tunnel closed (exit code: {poll_result})", "INFO")
+                    self.ssh_tunnel_active = False
+                    self.root.after(0, self.on_ssh_tunnel_closed)
+                    break
+            
+            time.sleep(2)
 
     def on_ssh_tunnel_closed(self):
-        """Called when SSH tunnel process closes unexpectedly"""
+        """Called when SSH tunnel closes"""
         self.update_ssh_status(False)
         if hasattr(self, 'ssh_connect_btn'):
             self.ssh_connect_btn.config(state="normal")
@@ -2018,28 +2543,12 @@ YOUR_USERNAME : EAP "YOUR_PASSWORD"
         if hasattr(self, 'ssh_terminal_btn'):
             self.ssh_terminal_btn.config(state="disabled")
         
-        # Read debug log for error info
-        debug_log = os.path.join(self.base_dir, "ssh_tunnel_debug.log")
-        error_msg = "SSH tunnel closed unexpectedly"
-        try:
-            if os.path.exists(debug_log):
-                with open(debug_log, 'r') as f:
-                    content = f.read().strip()
-                    lines = [line.strip() for line in content.split('\n') if line.strip()]
-                    if lines:
-                        # Find SSH Error line
-                        for line in lines[-3:]:  # Check last 3 lines
-                            if "SSH Error:" in line or "connect to host" in line or "Exit code" in line:
-                                error_msg = line
-                                break
-        except Exception as e:
-            error_msg = f"SSH connection failed: {str(e)}"
-        
-        self.log_message(error_msg, "WARN")
-        messagebox.showwarning("SSH Tunnel", error_msg)
+        self.log_message("SSH tunnel closed", "INFO")
+        messagebox.showinfo("SSH Tunnel", "SSH tunnel connection closed")
+
 
     def open_ssh_terminal(self):
-        """Open SSH terminal window (Putty-like)"""
+        """Open SSH terminal window using the active tunnel"""
         if not self.ssh_tunnel_active:
             messagebox.showwarning("Status", "SSH tunnel not active. Please connect first.")
             return
@@ -2052,46 +2561,58 @@ YOUR_USERNAME : EAP "YOUR_PASSWORD"
             messagebox.showerror("Validation", "SSH connection details are incomplete")
             return
         
+        # Check if port is open before opening terminal
+        self.log_message(f"Checking if {host}:{port} is open...", "INFO")
+        if not self.check_port_open(host, port):
+            messagebox.showerror("Connection Error", 
+                f"SSH port {port} on {host} is not accessible.\n\n"
+                f"Terminal cannot connect. Please verify:\n"
+                f"• The host address is correct\n"
+                f"• The port number is correct\n"
+                f"• SSH service is running on the remote host\n"
+                f"• Network connectivity and firewall rules")
+            self.log_message(f"Port {port} on {host} is not open", "ERROR")
+            return
+        
+        self.log_message(f"Port {port} on {host} is open", "INFO")
+        self._open_terminal_window(host, port, user)
+    
+    def _open_terminal_window(self, host, port, user):
+        """Actually open the terminal window"""
         try:
-            # Build SSH command string
-            ssh_cmd_str = f"ssh -p {port}"
-            
-            # Add authentication
-            if self.ssh_auth_var.get() == "key":
-                key_file = self.ssh_key_entry.get()
-                if key_file and os.path.exists(key_file):
-                    ssh_cmd_str += f" -i {key_file}"
-            
-            # Add host
-            ssh_cmd_str += f" {user}@{host}"
+            # Terminal connects to the remote host through the SSH tunnel
+            # Use the same connection details from UI
+            ssh_cmd_str = f"ssh -p {port} {user}@{host}"
             
             # Open in terminal based on OS
             if SYSTEM_OS == "Linux":
                 # Try different terminal emulators
-                terminals = {
-                    "gnome-terminal": ["{term}", "--", "bash", "-c", "{cmd}"],
-                    "xfce4-terminal": ["{term}", "-e", "{cmd}"],
-                    "konsole": ["{term}", "-e", "{cmd}"],
-                    "xterm": ["{term}", "-e", "{cmd}"],
-                }
+                terminals = [
+                    ("gnome-terminal", lambda cmd: ["gnome-terminal", "--", "bash", "-c", cmd]),
+                    ("xfce4-terminal", lambda cmd: ["xfce4-terminal", "-e", cmd]),
+                    ("konsole", lambda cmd: ["konsole", "-e", cmd]),
+                    ("xterm", lambda cmd: ["xterm", "-e", cmd]),
+                    ("mate-terminal", lambda cmd: ["mate-terminal", "-x", cmd]),
+                    ("lxterm", lambda cmd: ["lxterm", "-e", cmd]),
+                ]
                 
                 terminal_found = False
-                for term_name, term_args in terminals.items():
+                for term_name, cmd_builder in terminals:
                     if shutil.which(term_name):
-                        # Replace placeholders
-                        cmd_args = [arg.format(term=term_name, cmd=ssh_cmd_str) for arg in term_args]
-                        subprocess.Popen(cmd_args)
+                        cmd_list = cmd_builder(ssh_cmd_str)
+                        subprocess.Popen(cmd_list)
                         self.log_message(f"SSH terminal opened: {user}@{host}:{port}", "INFO")
                         terminal_found = True
                         break
                 
                 if not terminal_found:
-                    messagebox.showwarning("Warning", "No terminal emulator found. Tried: " + ", ".join(terminals.keys()))
+                    terminal_names = [t[0] for t in terminals]
+                    messagebox.showwarning("Warning", "No terminal emulator found. Tried: " + ", ".join(terminal_names))
             
             elif IS_MAC:
                 # macOS - use Terminal.app via AppleScript
-                # Escape quotes in SSH command for AppleScript
-                escaped_ssh = ssh_cmd_str.replace('"', '\\"')
+                # Properly escape quotes for AppleScript
+                escaped_ssh = ssh_cmd_str.replace('"', '\\"').replace("'", "\\'")
                 script = f'tell application "Terminal" to do script "{escaped_ssh}"'
                 subprocess.Popen(["osascript", "-e", script])
                 self.log_message(f"SSH terminal opened: {user}@{host}:{port}", "INFO")
